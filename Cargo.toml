@@ -3,7 +3,8 @@ name = "bitchord"
 version = "2.0.0"
 edition = "2024"
 license = "GPL-3.0-only"
-repository = "https://github.com/jackychan4891/BitChord-PC-Continued"
+authors = ["pearle <https://github.com/pearleseed>"]
+repository = "https://github.com/pearleseed/BitChord-PC-Continued"
 description = "Native BitChord client"
 
 [dependencies]
@@ -25,7 +26,7 @@ localzone = "0.3.1"
 log = "0.4.34"
 memmap2 = "0.9.11"
 raw-window-handle = "0.6"
-reqwest = { version = "0.12", default-features = false, features = ["default-tls", "gzip", "json", "socks"] }
+reqwest = { version = "0.12", default-features = false, features = ["default-tls", "gzip", "json", "socks", "http2"] }
 rodio = { version = "0.22.2", default-features = false, features = ["playback", "symphonia-aac", "symphonia-isomp4", "symphonia-flac", "symphonia-alac", "symphonia-wav", "symphonia-mp3", "symphonia-vorbis"] }
 rquickjs = "0.14.0"
 roxmltree = "0.21.1"
