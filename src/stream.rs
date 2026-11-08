@@ -195,7 +195,36 @@ impl Shared {
         self.inner.lock().unwrap().blocks.iter().all(Option::is_some)
     }
 
+    /// True if at least `n` blocks have been fetched, or the whole file is done.
+    pub fn has_buffered(&self, n: usize) -> bool {
+        let inner = self.inner.lock().unwrap();
+        inner.fetched >= n || inner.blocks.iter().all(Option::is_some)
+    }
+
+    /// Wait until at least `blocks` have arrived or the stream completes/fails/cancels.
+    pub async fn wait_buffered(&self, blocks: usize) {
+        loop {
+            if self.has_buffered(blocks) {
+                return;
+            }
+            {
+                let inner = self.inner.lock().unwrap();
+                if inner.cancelled || inner.error.is_some() || inner.fetched == inner.blocks.len() {
+                    return;
+                }
+            }
+            let notified = self.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.has_buffered(blocks) {
+                return;
+            }
+            notified.await;
+        }
+    }
+
     /// Wait until the download stops, however it ends.
+    #[allow(dead_code)]
     pub async fn finished(&self) {
         let _ = self.done.subscribe().wait_for(|d| *d).await;
     }
@@ -820,5 +849,124 @@ mod tests {
     fn test_empty_buffer_claim() {
         let shared = Shared::new(0, 0, None, Format::Aac, None, false);
         assert_eq!(shared.claim(), Claim::Done);
+    }
+
+    #[test]
+    fn test_has_buffered() {
+        let total = 5 * BLOCK;
+        let shared = Shared::new(total, 0, None, Format::Aac, None, false);
+
+        assert!(shared.has_buffered(0));
+        assert!(!shared.has_buffered(1));
+        assert!(!shared.has_buffered(3));
+
+        shared.put(0, Bytes::from(vec![0u8; BLOCK as usize]));
+        assert!(shared.has_buffered(1));
+        assert!(!shared.has_buffered(2));
+
+        shared.put(1, Bytes::from(vec![0u8; BLOCK as usize]));
+        shared.put(2, Bytes::from(vec![0u8; BLOCK as usize]));
+        assert!(shared.has_buffered(3));
+        assert!(!shared.has_buffered(4));
+
+        // Short stream with fewer blocks than requested
+        let short = Shared::new(2 * BLOCK, 0, None, Format::Aac, None, false);
+        assert!(!short.has_buffered(3));
+        short.put(0, Bytes::from(vec![0u8; BLOCK as usize]));
+        short.put(1, Bytes::from(vec![0u8; BLOCK as usize]));
+        // Complete file returns true even if requested blocks > total blocks
+        assert!(short.has_buffered(3));
+    }
+
+    #[tokio::test]
+    async fn test_wait_buffered_immediate_when_ready() {
+        let total = 3 * BLOCK;
+        let shared = Shared::new(total, 0, None, Format::Aac, None, false);
+        shared.put(0, Bytes::from(vec![0u8; BLOCK as usize]));
+        shared.put(1, Bytes::from(vec![0u8; BLOCK as usize]));
+
+        // Waiting for 2 blocks when 2 are already present returns immediately
+        tokio::time::timeout(Duration::from_millis(50), shared.wait_buffered(2))
+            .await
+            .expect("should return immediately when already buffered");
+    }
+
+    #[tokio::test]
+    async fn test_wait_buffered_waits_for_incoming_blocks() {
+        let total = 5 * BLOCK;
+        let shared = Shared::new(total, 0, None, Format::Aac, None, false);
+
+        let s = shared.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            s.put(0, Bytes::from(vec![0u8; BLOCK as usize]));
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            s.put(1, Bytes::from(vec![0u8; BLOCK as usize]));
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            s.put(2, Bytes::from(vec![0u8; BLOCK as usize]));
+        });
+
+        tokio::time::timeout(Duration::from_millis(500), shared.wait_buffered(3))
+            .await
+            .expect("should complete once 3 blocks are buffered");
+
+        assert!(shared.has_buffered(3));
+    }
+
+    #[tokio::test]
+    async fn test_wait_buffered_returns_on_cancel() {
+        let total = 5 * BLOCK;
+        let shared = Shared::new(total, 0, None, Format::Aac, None, false);
+
+        let s = shared.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            s.cancel();
+        });
+
+        tokio::time::timeout(Duration::from_millis(200), shared.wait_buffered(3))
+            .await
+            .expect("should return when cancelled");
+
+        assert!(!shared.has_buffered(3));
+    }
+
+    #[tokio::test]
+    async fn test_wait_buffered_returns_on_fail() {
+        let total = 5 * BLOCK;
+        let shared = Shared::new(total, 0, None, Format::Aac, None, false);
+
+        let s = shared.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            s.fail("network error".to_string());
+        });
+
+        tokio::time::timeout(Duration::from_millis(200), shared.wait_buffered(3))
+            .await
+            .expect("should return when failed");
+
+        assert!(!shared.has_buffered(3));
+    }
+
+    #[tokio::test]
+    async fn test_wait_buffered_completes_when_short_file_finishes() {
+        let total = 2 * BLOCK;
+        let shared = Shared::new(total, 0, None, Format::Aac, None, false);
+
+        let s = shared.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            s.put(0, Bytes::from(vec![0u8; BLOCK as usize]));
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            s.put(1, Bytes::from(vec![0u8; BLOCK as usize]));
+        });
+
+        // Requested 4 blocks, but file only has 2 blocks. Should finish when all 2 are fetched.
+        tokio::time::timeout(Duration::from_millis(500), shared.wait_buffered(4))
+            .await
+            .expect("should return when short stream completely fetched");
+
+        assert!(shared.has_buffered(4));
     }
 }

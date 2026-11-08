@@ -946,7 +946,7 @@ impl Backend {
         Ok(Resp::Uploaded { done, failed })
     }
 
-    /// Open the next song's stream ahead of time, once the playing one has downloaded.
+    /// Open the next song's stream ahead of time, once the playing one has buffered enough.
     /// `song_of`: the music video it stands for, whose song version is what will play.
     /// `track`: the song as listed, for a hi-res source's search.
     async fn prefetch(&self, video_id: String, song_of: Option<Track>, track: Option<Track>) -> anyhow::Result<()> {
@@ -956,10 +956,10 @@ impl Backend {
         let song = self.song_version(&video_id, song_of.as_ref(), PREFETCH_SONG_WAIT).await;
         let meta = song.clone().or_else(|| song_of.clone()).or_else(|| track);
         let video_id = song.map_or(video_id, |s| s.id);
-        // Let the playing song finish downloading first: it gets the whole bandwidth.
         let playing = self.current.lock().unwrap().as_ref().map(|(_, s)| s.clone());
         if let Some(s) = playing {
-            s.finished().await;
+            // Buffer ~3 blocks (~40s of audio) of the current song before starting to prefetch the next track
+            s.wait_buffered(3).await;
         }
         if self.audio.status.wanted_gen.load(Ordering::Relaxed) != generation
             || self.prefetched.lock().unwrap().as_ref().is_some_and(|(id, _)| *id == video_id)
