@@ -99,9 +99,11 @@ impl App {
             self.buffering = false;
             self.skip_streak = 0;
             self.prefetch_next();
-            self.request_art();
-            if let Some(shown) = self.playing_as().cloned().or_else(|| self.current().cloned()) {
-                self.refresh_lyrics(shown);
+            if self.mix_hold().is_none() {
+                self.request_art();
+                if let Some(shown) = self.playing_as().cloned().or_else(|| self.current().cloned()) {
+                    self.refresh_lyrics(shown);
+                }
             }
             self.top_up();
             // Dev hook: YTM_SEEK=<secs> jumps into the first track once it starts.
@@ -459,7 +461,9 @@ impl App {
                     };
                     if self.mix_hold().is_none() {
                         self.show_in_media(&shown);
-                        self.refresh_lyrics(shown);
+                        if !self.buffering {
+                            self.refresh_lyrics(shown);
+                        }
                     }
                     // A jam began while it was being looked up: everyone plays the host's upload.
                     if self.jam.active() {
