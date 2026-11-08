@@ -96,6 +96,7 @@ impl Inner {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
 enum Claim {
     Block(usize),
     /// Everything allowed so far is fetched or in flight; wait for the limit to lift.
@@ -217,7 +218,25 @@ impl Shared {
             return Claim::Done;
         }
         let n = inner.blocks.len();
+        if n == 0 {
+            return Claim::Done;
+        }
         let start = inner.want.min(n.saturating_sub(1));
+
+        // Prioritize the wanted block (Block 0 on startup or seek target):
+        // Readers block waiting for `want`, so ensure it receives 100% bandwidth
+        // before parallel workers compete.
+        if inner.blocks[start].is_none() {
+            if inner.in_flight[start] {
+                return Claim::Wait;
+            }
+            if start < inner.limit && inner.in_window(start) {
+                inner.in_flight[start] = true;
+                return Claim::Block(start);
+            }
+            return Claim::Wait;
+        }
+
         let mut missing = false;
         for i in (start..n).chain(0..start) {
             if inner.blocks[i].is_some() || inner.in_flight[i] {
@@ -251,6 +270,7 @@ impl Shared {
             }
         }
         self.ready.notify_all();
+        self.changed.notify_waiters();
     }
 
     fn fail(&self, err: String) {
@@ -258,6 +278,7 @@ impl Shared {
         FAIL_FROM.store(usize::MAX, std::sync::atomic::Ordering::Relaxed);
         self.inner.lock().unwrap().error = Some(err);
         self.ready.notify_all();
+        self.changed.notify_waiters();
     }
 
     fn range(&self, idx: usize) -> (u64, u64) {
@@ -698,5 +719,106 @@ impl rodio::Source for PcmSource {
         let byte = frame * self.channels as u64 * 2;
         self.reader.seek(SeekFrom::Start(byte)).map_err(|e| rodio::source::SeekError::Other(std::sync::Arc::new(e)))?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_head_block_priority() {
+        let total = 4 * BLOCK;
+        let shared = Shared::new(total, 0, None, Format::Aac, None, false);
+
+        // First worker claims block 0
+        assert_eq!(shared.claim(), Claim::Block(0));
+
+        // Other workers must wait while block 0 is downloading (100% bandwidth to head block)
+        assert_eq!(shared.claim(), Claim::Wait);
+        assert_eq!(shared.claim(), Claim::Wait);
+
+        // Block 0 arrives
+        shared.put(0, Bytes::from(vec![0u8; BLOCK as usize]));
+
+        // Now subsequent blocks can be claimed in parallel
+        assert_eq!(shared.claim(), Claim::Block(1));
+        assert_eq!(shared.claim(), Claim::Block(2));
+        assert_eq!(shared.claim(), Claim::Block(3));
+
+        // All blocks of the file have now been claimed
+        assert_eq!(shared.claim(), Claim::Done);
+    }
+
+    #[test]
+    fn test_prefetch_limit_wait() {
+        let total = 4 * BLOCK;
+        // head_only = true sets limit to HEAD_BLOCKS (2)
+        let shared = Shared::new(total, 0, None, Format::Aac, None, true);
+
+        assert_eq!(shared.claim(), Claim::Block(0));
+        shared.put(0, Bytes::from(vec![0u8; BLOCK as usize]));
+
+        assert_eq!(shared.claim(), Claim::Block(1));
+        shared.put(1, Bytes::from(vec![0u8; BLOCK as usize]));
+
+        // Block 2 and 3 are missing, but limit is 2 -> must Wait for reader
+        assert_eq!(shared.claim(), Claim::Wait);
+
+        // Reader attaches, lifting the limit
+        let _reader = StreamReader::new(shared.clone());
+
+        // Now block 2 can be claimed
+        assert_eq!(shared.claim(), Claim::Block(2));
+    }
+
+    #[test]
+    fn test_seek_block_priority() {
+        let total = 10 * BLOCK;
+        let shared = Shared::new(total, 0, None, Format::Aac, None, false);
+
+        // Put block 0
+        assert_eq!(shared.claim(), Claim::Block(0));
+        shared.put(0, Bytes::from(vec![0u8; BLOCK as usize]));
+
+        // Simulate seek to block 5
+        {
+            let mut inner = shared.inner.lock().unwrap();
+            inner.want = 5;
+        }
+
+        // Wanted block 5 gets exclusive priority
+        assert_eq!(shared.claim(), Claim::Block(5));
+        assert_eq!(shared.claim(), Claim::Wait);
+
+        // Block 5 arrives
+        shared.put(5, Bytes::from(vec![0u8; BLOCK as usize]));
+
+        // Subsequent blocks claimed in parallel
+        assert_eq!(shared.claim(), Claim::Block(6));
+        assert_eq!(shared.claim(), Claim::Block(7));
+    }
+
+    #[tokio::test]
+    async fn test_put_notifies_changed() {
+        let total = 2 * BLOCK;
+        let shared = Shared::new(total, 0, None, Format::Aac, None, false);
+
+        assert_eq!(shared.claim(), Claim::Block(0));
+        let notified = shared.changed.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+
+        shared.put(0, Bytes::from(vec![0u8; BLOCK as usize]));
+
+        tokio::time::timeout(Duration::from_millis(100), notified)
+            .await
+            .expect("put should notify changed");
+    }
+
+    #[test]
+    fn test_empty_buffer_claim() {
+        let shared = Shared::new(0, 0, None, Format::Aac, None, false);
+        assert_eq!(shared.claim(), Claim::Done);
     }
 }
