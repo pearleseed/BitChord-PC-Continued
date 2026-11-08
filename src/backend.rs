@@ -440,7 +440,7 @@ type StreamSlot = Arc<std::sync::Mutex<Option<(String, Arc<Shared>)>>>;
 type SongCell = Arc<tokio::sync::OnceCell<Option<Track>>>;
 
 /// How long a play waits for a music video's song version before playing the video.
-const PLAY_SONG_WAIT: std::time::Duration = std::time::Duration::from_millis(2500);
+const PLAY_SONG_WAIT: std::time::Duration = std::time::Duration::from_millis(350);
 /// A prefetch has until the song before it ends.
 const PREFETCH_SONG_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
 /// How long playback waits for the hi-res sources before falling back to YouTube. A cold
