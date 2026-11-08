@@ -198,27 +198,26 @@ impl Shared {
     /// True if at least `n` blocks have been fetched, or the whole file is done.
     pub fn has_buffered(&self, n: usize) -> bool {
         let inner = self.inner.lock().unwrap();
-        inner.fetched >= n || inner.blocks.iter().all(Option::is_some)
+        inner.fetched >= n || inner.fetched >= inner.blocks.len() || inner.blocks.iter().all(Option::is_some)
     }
 
     /// Wait until at least `blocks` have arrived or the stream completes/fails/cancels.
     pub async fn wait_buffered(&self, blocks: usize) {
         loop {
+            let notified = self.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+
             if self.has_buffered(blocks) {
                 return;
             }
             {
                 let inner = self.inner.lock().unwrap();
-                if inner.cancelled || inner.error.is_some() || inner.fetched == inner.blocks.len() {
+                if inner.cancelled || inner.error.is_some() || inner.fetched >= inner.blocks.len() {
                     return;
                 }
             }
-            let notified = self.changed.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            if self.has_buffered(blocks) {
-                return;
-            }
+
             notified.await;
         }
     }
