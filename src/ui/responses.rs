@@ -99,6 +99,11 @@ impl App {
             self.buffering = false;
             self.skip_streak = 0;
             self.prefetch_next();
+            self.request_art();
+            if let Some(shown) = self.playing_as().cloned().or_else(|| self.current().cloned()) {
+                self.refresh_lyrics(shown);
+            }
+            self.top_up();
             // Dev hook: YTM_SEEK=<secs> jumps into the first track once it starts.
             if self.generation == 1 {
                 if let Some(s) = std::env::var("YTM_SEEK").ok().and_then(|v| v.parse::<f32>().ok()) {

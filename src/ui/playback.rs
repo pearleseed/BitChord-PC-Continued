@@ -321,14 +321,13 @@ impl App {
             // The outgoing song keeps the art, lyrics and media info it still deserves.
         } else {
             self.show_in_media(&shown);
-            // Background art follows the track; lyrics and segments, what plays.
-            self.request_art();
-            self.refresh_lyrics(shown);
+            self.lyrics = None;
+            self.segments = None;
+            self.lyric_view.reset();
         }
         if let Some(m) = &mut self.media {
             m.set_playing(true);
         }
-        self.top_up();
     }
 
     /// The playing track's title, artist and length for the system's media controls,
