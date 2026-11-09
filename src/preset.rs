@@ -418,10 +418,6 @@ pub fn all() -> &'static [Preset] {
     })
 }
 
-pub fn get(id: &str) -> &'static Preset {
-    all().iter().find(|p| p.id == id).unwrap_or(&all()[0])
-}
-
 static ACTIVE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// Make `id` the preset that widgets without access to the app read from.
@@ -434,12 +430,6 @@ pub fn active() -> &'static Preset {
     &all()[ACTIVE.load(std::sync::atomic::Ordering::Relaxed).min(all().len() - 1)]
 }
 
-/// The preset's cover thumbnail (JPEG), if it has one.
-pub fn cover(id: &str) -> Option<&'static [u8]> {
-    const COVERS: &[(&str, &[u8])] = include!(concat!(env!("OUT_DIR"), "/theme_covers.rs"));
-    COVERS.iter().find(|(k, _)| *k == id).map(|(_, b)| *b)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -449,14 +439,15 @@ mod tests {
     fn presets_are_complete() {
         let list: Vec<Preset> = serde_json::from_str(include_str!("../assets/themes/presets.json")).expect("presets.json parses");
         assert_eq!(list.len(), 27);
+        let covers = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/themes/covers");
         let mut ids = std::collections::HashSet::new();
         for p in &list {
             assert!(ids.insert(p.id.clone()), "duplicate id {}", p.id);
             assert!(!p.name.is_empty() && !p.creators.is_empty() && !p.blurb.is_empty(), "{} lacks name/creators/blurb", p.id);
-            assert!(cover(&p.id).is_some(), "{} has no cover", p.id);
+            assert!(covers.join(format!("{}.jpg", p.id)).is_file(), "{} has no cover", p.id);
             assert!(matches!(p.accent.as_str(), "cover" | "system" | "") || hex(&p.accent).is_some(), "{} accent {}", p.id, p.accent);
         }
         assert_eq!(all().len(), list.len() + 1);
-        assert_eq!(get("nope").id, DEFAULT_ID);
+        assert_eq!(all()[0].id, DEFAULT_ID);
     }
 }

@@ -6,10 +6,13 @@
 //! texture and draws it in place of the still sleeve.
 
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, Weak};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(windows)]
+use std::time::Instant;
 
 pub struct Frame {
     pub w: usize,
@@ -18,15 +21,14 @@ pub struct Frame {
 }
 
 pub struct Motion {
-    url: String,
     latest: Mutex<Option<Arc<Frame>>>,
     version: AtomicU64,
     stop: Arc<AtomicBool>,
 }
 
 impl Motion {
-    fn new(url: &str) -> Self {
-        Self { url: url.to_owned(), latest: Mutex::new(None), version: AtomicU64::new(0), stop: Arc::new(AtomicBool::new(false)) }
+    fn new() -> Self {
+        Self { latest: Mutex::new(None), version: AtomicU64::new(0), stop: Arc::new(AtomicBool::new(false)) }
     }
 
     /// The newest frame, with the counter that says it changed.
@@ -35,15 +37,12 @@ impl Motion {
         Some((self.version.load(Ordering::Acquire), frame))
     }
 
-    pub fn url(&self) -> &str {
-        &self.url
-    }
-
     /// Stop decoding: the page that showed this clip is gone.
     pub fn stop(&self) {
         self.stop.store(true, Ordering::Relaxed);
     }
 
+    #[cfg(windows)]
     fn publish(&self, ctx: &egui::Context, w: usize, h: usize, rgba: Vec<u8>) {
         if let Ok(mut slot) = self.latest.lock() {
             *slot = Some(Arc::new(Frame { w, h, rgba }));
@@ -68,13 +67,13 @@ pub fn play(ctx: &egui::Context, master: &str, max_width: u32) -> Arc<Motion> {
         if let Some(m) = streams.get(&key).and_then(Weak::upgrade) {
             return m;
         }
-        let motion = Arc::new(Motion::new(master));
+        let motion = Arc::new(Motion::new());
         streams.insert(key, Arc::downgrade(&motion));
         let (this, ctx, url) = (motion.clone(), ctx.clone(), master.to_owned());
         let _ = std::thread::Builder::new().name("motion".into()).spawn(move || run(this, ctx, url, max_width));
         return motion;
     }
-    Arc::new(Motion::new(master))
+    Arc::new(Motion::new())
 }
 
 fn run(motion: Arc<Motion>, ctx: egui::Context, master: String, max_width: u32) {
@@ -95,8 +94,12 @@ fn fetch(master: &str, max_width: u32) -> Option<PathBuf> {
         let file = crate::apple::media_file(&http, &media).await?;
         let dir = crate::data_dir().join("motion");
         std::fs::create_dir_all(&dir).ok()?;
-        let name = format!("{:x}", Sha1::digest(file.as_bytes()));
-        let path = dir.join(format!("{}.mp4", &name[..32]));
+        let mut name = String::with_capacity(36);
+        for byte in &Sha1::digest(file.as_bytes())[..16] {
+            write!(&mut name, "{byte:02x}").expect("writing to a String cannot fail");
+        }
+        name.push_str(".mp4");
+        let path = dir.join(name);
         if std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0) > 1024 {
             return Some(path);
         }
@@ -275,7 +278,7 @@ mod tests {
             .find(|p| p.extension().is_some_and(|e| e == "mp4"))
             .expect("no cached clip");
         let ctx = egui::Context::default();
-        let motion = Arc::new(Motion::new("test"));
+        let motion = Arc::new(Motion::new());
         let this = motion.clone();
         std::thread::spawn(move || decode(&this, &path, &ctx));
         let start = Instant::now();

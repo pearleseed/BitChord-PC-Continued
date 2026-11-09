@@ -24,7 +24,6 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 const LATEST: &str = "https://api.github.com/repos/grapedjuice/ytm-rs/releases/latest";
-const ALL_RELEASES: &str = "https://api.github.com/repos/grapedjuice/ytm-rs/releases";
 const BY_TAG: &str = "https://api.github.com/repos/grapedjuice/ytm-rs/releases/tags/v";
 pub const RELEASES: &str = "https://github.com/grapedjuice/ytm-rs/releases";
 
@@ -48,8 +47,6 @@ pub struct Updater {
     dir: PathBuf,
     wake: Arc<dyn Fn() + Send + Sync>,
     notes: Notes,
-    /// Total downloads of every release asset: None until asked, Some(None) while fetching.
-    downloads: Arc<Mutex<Option<Option<u64>>>>,
 }
 
 pub fn current_version() -> String {
@@ -137,7 +134,7 @@ pub fn newer(a: &str, b: &str) -> bool {
 
 impl Updater {
     pub fn new(data_dir: &Path, wake: impl Fn() + Send + Sync + 'static) -> Self {
-        Self { state: Arc::new(Mutex::new(State::Idle)), dir: data_dir.join("updates"), wake: Arc::new(wake), notes: Default::default(), downloads: Default::default() }
+        Self { state: Arc::new(Mutex::new(State::Idle)), dir: data_dir.join("updates"), wake: Arc::new(wake), notes: Default::default() }
     }
 
     pub fn state(&self) -> State {
@@ -177,43 +174,6 @@ impl Updater {
             if body.is_some() {
                 this.notes.lock().unwrap().insert(version.clone(), body);
                 (this.wake)();
-            }
-        });
-        None
-    }
-
-    /// How many times ytm-rs has been downloaded: every release asset's GitHub download
-    /// count added up (installers, plus the copies the updater fetched). Fetched in the
-    /// background the first time it's asked for; `None` until it arrives.
-    pub fn downloads(&self) -> Option<u64> {
-        {
-            let mut d = self.downloads.lock().unwrap();
-            if let Some(n) = *d {
-                return n;
-            }
-            *d = Some(None);
-        }
-        let this = self.clone();
-        std::thread::spawn(move || {
-            let fetch = async {
-                let http = client()?;
-                let mut total = 0;
-                for page in 1.. {
-                    let releases: Vec<serde_json::Value> = http.get(format!("{ALL_RELEASES}?per_page=100&page={page}")).send().await?.error_for_status()?.json().await?;
-                    total += releases.iter().flat_map(|r| r["assets"].as_array().into_iter().flatten()).filter_map(|a| a["download_count"].as_u64()).sum::<u64>();
-                    if releases.len() < 100 {
-                        break;
-                    }
-                }
-                anyhow::Ok(total)
-            };
-            let total = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(anyhow::Error::from).and_then(|rt| rt.block_on(fetch));
-            match total {
-                Ok(n) => {
-                    *this.downloads.lock().unwrap() = Some(Some(n));
-                    (this.wake)();
-                }
-                Err(e) => log::warn!("update: download count: {e:#}"),
             }
         });
         None

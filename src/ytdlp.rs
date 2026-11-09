@@ -38,6 +38,8 @@ pub struct Stream {
 
 /// Path to an up-to-date yt-dlp, downloading it if missing or stale.
 async fn ensure(http: &reqwest::Client, data_dir: &Path) -> anyhow::Result<PathBuf> {
+    static INSTALL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let _install = INSTALL.lock().await;
     let bin = data_dir.join(BIN);
     let fresh = std::fs::metadata(&bin)
         .and_then(|m| m.modified())
@@ -63,7 +65,9 @@ pub async fn resolve(http: &reqwest::Client, data_dir: &Path, cookie: &str, vide
     let bin = ensure(http, data_dir).await?;
     let data_dir = data_dir.to_owned();
     let (cookie, video_id) = (cookie.to_owned(), video_id.to_owned());
-    let mut s = tokio::task::spawn_blocking(move || run(&bin, &data_dir, &video_id, &cookie)).await??;
+    let (keep_running, cancelled) = crossbeam_channel::bounded(0);
+    let mut s = tokio::task::spawn_blocking(move || run(&bin, &data_dir, &video_id, &cookie, cancelled)).await??;
+    drop(keep_running);
     // The range downloader needs the exact size; yt-dlp sometimes only estimates it.
     if s.size == 0 {
         let head = http.head(&s.url).header("User-Agent", &s.user_agent).send().await?.error_for_status()?;
@@ -74,7 +78,8 @@ pub async fn resolve(http: &reqwest::Client, data_dir: &Path, cookie: &str, vide
     Ok(s)
 }
 
-fn run(bin: &Path, data_dir: &Path, video_id: &str, cookie: &str) -> anyhow::Result<Stream> {
+fn run(bin: &Path, data_dir: &Path, video_id: &str, cookie: &str, cancelled: crossbeam_channel::Receiver<()>) -> anyhow::Result<Stream> {
+    anyhow::ensure!(cancelled.try_recv() != Err(crossbeam_channel::TryRecvError::Disconnected), "yt-dlp request cancelled");
     // Unique name per call; removed on every exit path by the guard below.
     let nonce = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
     let jar = data_dir.join(format!("cookies-{nonce}.txt"));
@@ -111,19 +116,16 @@ fn run(bin: &Path, data_dir: &Path, video_id: &str, cookie: &str) -> anyhow::Res
         use std::os::unix::process::CommandExt;
         cmd.process_group(0);
     }
-    // A stuck run (yt-dlp or its Node child hung on the network) would leave the song
-    // buffering for good: give it a minute and a half, then end its process tree.
+    // End the process tree if the caller drops this lookup or the subprocess stalls.
     let child = cmd.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn()?;
-    let (pid, done) = (child.id(), std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)));
-    let watch = done.clone();
+    let pid = child.id();
+    let (done, finished) = crossbeam_channel::bounded::<()>(0);
     std::thread::spawn(move || {
-        for _ in 0..90 {
-            std::thread::sleep(Duration::from_secs(1));
-            if watch.load(std::sync::atomic::Ordering::Relaxed) {
-                return;
-            }
+        crossbeam_channel::select_biased! {
+            recv(finished) -> _ => return,
+            recv(cancelled) -> _ => log::debug!("yt-dlp request cancelled; stopping it"),
+            default(Duration::from_secs(90)) => log::warn!("yt-dlp took too long; stopping it"),
         }
-        log::warn!("yt-dlp took too long; stopping it");
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
@@ -139,7 +141,7 @@ fn run(bin: &Path, data_dir: &Path, video_id: &str, cookie: &str) -> anyhow::Res
         }
     });
     let out = child.wait_with_output();
-    done.store(true, std::sync::atomic::Ordering::Relaxed);
+    drop(done);
     let out = out?;
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr);

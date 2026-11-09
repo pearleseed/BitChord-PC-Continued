@@ -240,6 +240,18 @@ impl Shared {
         self.changed.notify_waiters();
     }
 
+    async fn cancelled(&self) {
+        loop {
+            let notified = self.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.inner.lock().unwrap().cancelled {
+                return;
+            }
+            notified.await;
+        }
+    }
+
     fn claim(&self) -> Claim {
         let mut inner = self.inner.lock().unwrap();
         if inner.cancelled || inner.error.is_some() {
@@ -346,11 +358,40 @@ impl UrlSlot {
 /// Download into `shared` with parallel range requests; returns when complete,
 /// failed, or every reader was dropped.
 pub async fn download(http: reqwest::Client, url: String, ua: String, shared: Arc<Shared>, refresh: Option<Refresh>, ranging: Ranging) {
-    // Addon servers may ignore ranges and answer 200 with the whole file: then one
-    // sequential download fills the buffer, rather than every worker pulling the file.
-    if ranging == Ranging::Header && !ranges_supported(&http, &url, &ua).await {
-        download_whole(&http, &url, &ua, &shared).await;
-        return;
+    tokio::select! {
+        biased;
+        _ = shared.cancelled() => {}
+        _ = download_stream(http, url, ua, shared.clone(), refresh, ranging) => {}
+    }
+    shared.done.send_replace(true);
+}
+
+async fn download_stream(http: reqwest::Client, url: String, ua: String, shared: Arc<Shared>, refresh: Option<Refresh>, ranging: Ranging) {
+    if ranging == Ranging::Header && shared.total > 0 {
+        // The first request checks range support and carries playable data. If the
+        // server ignores Range, keep reading that same response sequentially.
+        let (_, end) = shared.range(0);
+        if let Ok(response) = range_response(&http, &url, &ua, 0, end).await {
+            let status = response.status();
+            if status == reqwest::StatusCode::OK {
+                download_whole(response, &shared).await;
+                return;
+            }
+            if status == reqwest::StatusCode::PARTIAL_CONTENT
+                && let Ok(data) = read_response(response, end + 1).await
+            {
+                shared.put(0, data);
+            }
+            // Some origins reject Range but will serve an ordinary GET. If it
+            // also fails, the range workers still handle retries and URL renewal.
+            if matches!(status, reqwest::StatusCode::BAD_REQUEST | reqwest::StatusCode::FORBIDDEN | reqwest::StatusCode::RANGE_NOT_SATISFIABLE)
+                && let Ok(response) = send_request(http.get(&url).header("User-Agent", &ua).header("Accept-Encoding", "identity")).await
+                && response.status() == reqwest::StatusCode::OK
+            {
+                download_whole(response, &shared).await;
+                return;
+            }
+        }
     }
     let slot = Arc::new(UrlSlot { url: tokio::sync::Mutex::new((url, 0)), refresh });
     let mut set = tokio::task::JoinSet::new();
@@ -406,7 +447,6 @@ pub async fn download(http: reqwest::Client, url: String, ua: String, shared: Ar
         });
     }
     while set.join_next().await.is_some() {}
-    shared.done.send_replace(true);
 }
 
 fn is_forbidden(e: &anyhow::Error) -> bool {
@@ -426,86 +466,68 @@ pub fn init_dev_hooks() {
 }
 
 async fn fetch(http: &reqwest::Client, url: &str, ua: &str, expect: u64) -> anyhow::Result<Bytes> {
-    let stalled = || anyhow::anyhow!("no data for {} s", STALL.as_secs());
-    // Errors leave the URL out: it carries the client's IP address and signatures (logs).
-    let mut resp = tokio::time::timeout(STALL, http.get(url).header("User-Agent", ua).send())
-        .await
-        .map_err(|_| stalled())?
-        .and_then(reqwest::Response::error_for_status)
+    let resp = send_request(http.get(url).header("User-Agent", ua)).await?
+        .error_for_status()
         .map_err(reqwest::Error::without_url)?;
-    let mut buf = bytes::BytesMut::with_capacity(expect as usize);
+    read_response(resp, expect).await
+}
+
+/// A block from a server that takes standard `Range` headers. A 200 (the server ignored
+/// the range) still yields this block out of the whole body.
+async fn fetch_range(http: &reqwest::Client, url: &str, ua: &str, a: u64, b: u64, total: u64) -> anyhow::Result<Bytes> {
+    let response = range_response(http, url, ua, a, b).await?
+        .error_for_status()
+        .map_err(reqwest::Error::without_url)?;
+    if response.status() == reqwest::StatusCode::PARTIAL_CONTENT {
+        return read_response(response, b - a + 1).await;
+    }
+    let data = read_response(response, total).await?;
+    Ok(data.slice(a as usize..=b as usize))
+}
+
+async fn range_response(http: &reqwest::Client, url: &str, ua: &str, a: u64, b: u64) -> anyhow::Result<reqwest::Response> {
+    send_request(
+        http.get(url)
+            .header("User-Agent", ua)
+            .header("Range", format!("bytes={a}-{b}"))
+            .header("Accept-Encoding", "identity"),
+    ).await
+}
+
+async fn send_request(request: reqwest::RequestBuilder) -> anyhow::Result<reqwest::Response> {
+    // The URL contains signatures and can contain the client's IP address.
+    Ok(tokio::time::timeout(STALL, request.send()).await
+        .map_err(|_| anyhow::anyhow!("no data for {} s", STALL.as_secs()))?
+        .map_err(reqwest::Error::without_url)?)
+}
+
+async fn read_response(mut resp: reqwest::Response, expect: u64) -> anyhow::Result<Bytes> {
+    let stalled = || anyhow::anyhow!("no data for {} s", STALL.as_secs());
+    let mut buf = bytes::BytesMut::with_capacity((expect.min(BLOCK)) as usize);
     while let Some(chunk) = tokio::time::timeout(STALL, resp.chunk()).await.map_err(|_| stalled())?.map_err(reqwest::Error::without_url)? {
+        anyhow::ensure!(buf.len() as u64 + chunk.len() as u64 <= expect, "range response exceeded {expect} bytes");
         buf.extend_from_slice(&chunk);
     }
     anyhow::ensure!(buf.len() as u64 == expect, "short read: {} of {expect} bytes", buf.len());
     Ok(buf.freeze())
 }
 
-/// A block from a server that takes standard `Range` headers. A 200 (the server ignored
-/// the range) still yields this block out of the whole body.
-async fn fetch_range(http: &reqwest::Client, url: &str, ua: &str, a: u64, b: u64, total: u64) -> anyhow::Result<Bytes> {
-    let stalled = || anyhow::anyhow!("no data for {} s", STALL.as_secs());
-    let mut resp = tokio::time::timeout(
-        STALL,
-        http.get(url)
-            .header("User-Agent", ua)
-            .header("Range", format!("bytes={a}-{b}"))
-            .header("Accept-Encoding", "identity")
-            .send(),
-    )
-    .await
-    .map_err(|_| stalled())?
-    .and_then(reqwest::Response::error_for_status)
-    .map_err(reqwest::Error::without_url)?;
-    let partial = resp.status() == reqwest::StatusCode::PARTIAL_CONTENT;
-    let expect = if partial { b - a + 1 } else { total };
-    let mut buf = bytes::BytesMut::with_capacity(expect as usize);
-    while let Some(chunk) = tokio::time::timeout(STALL, resp.chunk()).await.map_err(|_| stalled())?.map_err(reqwest::Error::without_url)? {
-        buf.extend_from_slice(&chunk);
-    }
-    anyhow::ensure!(buf.len() as u64 == expect, "short read: {} of {expect} bytes", buf.len());
-    if partial {
-        return Ok(buf.freeze());
-    }
-    Ok(buf.freeze().slice(a as usize..=b as usize))
-}
-
-/// Whether the server honours a `Range` header with a 206. A server that answers 200
-/// gets one sequential download instead. A probe that can't connect leaves the workers
-/// to try ranges themselves (a 200 there is still handled).
-async fn ranges_supported(http: &reqwest::Client, url: &str, ua: &str) -> bool {
-    match tokio::time::timeout(STALL, http.get(url).header("User-Agent", ua).header("Range", "bytes=0-0").header("Accept-Encoding", "identity").send()).await {
-        Ok(Ok(r)) => r.status() == reqwest::StatusCode::PARTIAL_CONTENT,
-        _ => true,
-    }
-}
-
 /// One sequential download for a server that won't serve ranges, filling `shared` block
 /// by block as bytes arrive so playback can start before the file is complete.
-async fn download_whole(http: &reqwest::Client, url: &str, ua: &str, shared: &Arc<Shared>) {
+async fn download_whole(mut resp: reqwest::Response, shared: &Arc<Shared>) {
     let stalled = || anyhow::anyhow!("no data for {} s", STALL.as_secs());
     let result = async {
-        let mut resp = tokio::time::timeout(
-            STALL,
-            http.get(url).header("User-Agent", ua).header("Accept-Encoding", "identity").send(),
-        )
-        .await
-        .map_err(|_| stalled())?
-        .and_then(reqwest::Response::error_for_status)
-        .map_err(reqwest::Error::without_url)?;
         let block = BLOCK as usize;
         let blocks = shared.inner.lock().unwrap().blocks.len();
         let mut buf = bytes::BytesMut::with_capacity(block);
         let (mut idx, mut received) = (0usize, 0u64);
         while let Some(chunk) = tokio::time::timeout(STALL, resp.chunk()).await.map_err(|_| stalled())?.map_err(reqwest::Error::without_url)? {
             received += chunk.len() as u64;
+            anyhow::ensure!(received <= shared.total, "response exceeded {} bytes", shared.total);
             buf.extend_from_slice(&chunk);
             while buf.len() >= block && idx < blocks {
                 shared.put(idx, buf.split_to(block).freeze());
                 idx += 1;
-            }
-            if shared.inner.lock().unwrap().cancelled {
-                return anyhow::Ok(());
             }
         }
         anyhow::ensure!(received == shared.total, "short read: {received} of {} bytes", shared.total);
@@ -515,15 +537,8 @@ async fn download_whole(http: &reqwest::Client, url: &str, ua: &str, shared: &Ar
         anyhow::Ok(())
     }
     .await;
-    match result {
-        Ok(()) => {
-            shared.done.send_replace(true);
-        }
-        Err(e) => {
-            if !shared.inner.lock().unwrap().cancelled {
-                shared.fail(format!("stream: {e:#}"));
-            }
-        }
+    if let Err(e) = result {
+        shared.fail(format!("stream: {e:#}"));
     }
 }
 
@@ -652,6 +667,61 @@ pub fn decoder(shared: Arc<Shared>, seekable: bool) -> anyhow::Result<TrackDecod
     }
 }
 
+/// What the decoder is being fed, for stats for nerds: the codec, the rate and channels
+/// it decodes to, and the bitrate. The bit depth is the one a hi-res source states, as
+/// rodio's decoders don't report theirs.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Stats {
+    pub codec: String,
+    pub bit_depth: Option<u32>,
+    pub sample_rate: u32,
+    pub channels: u16,
+    pub bitrate_kbps: Option<u32>,
+}
+
+impl Stats {
+    /// `shared` as `decoder` reads it.
+    pub fn of(shared: &Shared, decoder: &TrackDecoder) -> Self {
+        let rate = rodio::Source::sample_rate(decoder).get();
+        let channels = rodio::Source::channels(decoder).get();
+        Self::from_parts(&shared.format, shared.info.as_ref(), shared.total, shared.duration_ms, rate, channels)
+    }
+
+    fn from_parts(format: &Format, info: Option<&crate::hires::Info>, size: u64, duration_ms: u64, sample_rate: u32, channels: u16) -> Self {
+        let codec = match info.map(|i| i.codec.trim()).filter(|c| !c.is_empty()) {
+            Some(c) => codec_label(c),
+            None => match format {
+                Format::Aac => "AAC".to_owned(),
+                Format::Opus => "Opus".to_owned(),
+                Format::File { hint, .. } => codec_label(hint),
+                Format::Pcm { .. } => "PCM".to_owned(),
+            },
+        };
+        let bit_depth = info.and_then(|i| i.bit_depth);
+        // Lossless reads as the rate its samples decode to (1,411 kbps for a CD), the
+        // figure Tidal, Qobuz and Apple Music print; lossy as the rate its source stated,
+        // or else the one the file's size and length make (when the size is known).
+        let measured = (duration_ms > 0 && size != crate::hires::UNKNOWN_SIZE)
+            .then(|| u32::try_from(u128::from(size) * 8 / u128::from(duration_ms)).ok()).flatten();
+        let bitrate_kbps = match bit_depth {
+            Some(bits) if info.is_some_and(|i| i.lossless()) => {
+                u32::try_from(u128::from(sample_rate) * u128::from(bits) * u128::from(channels) / 1000).ok()
+            }
+            _ => info.and_then(|i| i.bitrate_kbps).or(measured),
+        };
+        Self { codec, bit_depth, sample_rate, channels, bitrate_kbps: bitrate_kbps.filter(|k| *k > 0) }
+    }
+}
+
+/// A codec under its usual name: Opus and Vorbis as they're written, the rest in capitals.
+fn codec_label(codec: &str) -> String {
+    match codec.to_ascii_lowercase().as_str() {
+        "opus" => "Opus".to_owned(),
+        "vorbis" => "Vorbis".to_owned(),
+        _ => codec.to_ascii_uppercase(),
+    }
+}
+
 /// A song's decoder: Opus (our own), in-process PCM (decoded Atmos), or a file
 /// rodio decodes (AAC/MP4 included).
 pub enum TrackDecoder {
@@ -753,6 +823,48 @@ impl rodio::Source for PcmSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn info(codec: &str, bits: Option<u32>, kbps: Option<u32>) -> crate::hires::Info {
+        crate::hires::Info {
+            source: "Addon".into(),
+            host: "example".into(),
+            codec: codec.into(),
+            quality: String::new(),
+            bitrate_kbps: kbps,
+            sample_rate: None,
+            bit_depth: bits,
+            channels: None,
+            atmos: false,
+            size: 1,
+            duration_ms: 1,
+        }
+    }
+
+    #[test]
+    fn youtube_stats_come_from_the_stream() {
+        // 3.5 MB of Opus over 3:30: about 133 kbps.
+        let s = Stats::from_parts(&Format::Opus, None, 3_500_000, 210_000, 48_000, 2);
+        assert_eq!((s.codec.as_str(), s.bit_depth, s.bitrate_kbps), ("Opus", None, Some(133)));
+        assert_eq!(Stats::from_parts(&Format::Aac, None, 3_360_000, 210_000, 44_100, 2).codec, "AAC");
+        // A length nobody reported leaves the bitrate out rather than guessing.
+        assert_eq!(Stats::from_parts(&Format::Aac, None, 3_360_000, 0, 44_100, 2).bitrate_kbps, None);
+        // So does a size that's only the placeholder for one nobody reported.
+        let mp3 = Format::File { hint: "mp3", mime: None };
+        assert_eq!(Stats::from_parts(&mp3, Some(&info("mp3", None, None)), crate::hires::UNKNOWN_SIZE, 210_000, 44_100, 2).bitrate_kbps, None);
+    }
+
+    #[test]
+    fn lossless_reads_as_its_pcm_rate() {
+        let flac = Format::File { hint: "flac", mime: None };
+        let cd = Stats::from_parts(&flac, Some(&info("flac", Some(16), None)), 30_000_000, 210_000, 44_100, 2);
+        assert_eq!((cd.codec.as_str(), cd.bit_depth, cd.bitrate_kbps), ("FLAC", Some(16), Some(1411)));
+        let hires = Stats::from_parts(&flac, Some(&info("FLAC", Some(24), None)), 90_000_000, 210_000, 96_000, 2);
+        assert_eq!(hires.bitrate_kbps, Some(4608));
+        // Lossy from an addon keeps the rate it stated.
+        let mp3 = Stats::from_parts(&Format::File { hint: "mp3", mime: None }, Some(&info("mp3", None, Some(320))), 8_000_000, 210_000, 44_100, 2);
+        assert_eq!((mp3.codec.as_str(), mp3.bitrate_kbps), ("MP3", Some(320)));
+        assert_eq!(Stats::from_parts(&Format::Opus, Some(&info("OPUS", None, None)), 1, 1, 48_000, 2).codec, "Opus");
+    }
 
     #[test]
     fn test_head_block_priority() {

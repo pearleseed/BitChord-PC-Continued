@@ -302,8 +302,6 @@ pub fn icon_font(size: f32) -> FontId {
 
 /// Lucide icons (ISC), subset to the glyphs used here.
 pub mod icon {
-    pub const HOUSE: char = '\u{e0f5}';
-    pub const COMPASS: char = '\u{e09b}';
     pub const LIBRARY: char = '\u{e100}';
     pub const SEARCH: char = '\u{e151}';
     pub const CHEVRON_LEFT: char = '\u{e06e}';
@@ -312,12 +310,7 @@ pub mod icon {
     pub const CHEVRON_DOWN: char = '\u{e06d}';
     pub const PLAY: char = '\u{e13c}';
     pub const PAUSE: char = '\u{e12e}';
-    pub const SKIP_BACK: char = '\u{e15f}';
-    pub const SKIP_FORWARD: char = '\u{e160}';
     pub const SHUFFLE: char = '\u{e15e}';
-    pub const VOLUME_2: char = '\u{e1ab}';
-    pub const VOLUME_1: char = '\u{e1aa}';
-    pub const VOLUME_X: char = '\u{e1ac}';
     pub const HEART: char = '\u{e0f2}';
     pub const THUMBS_DOWN: char = '\u{e189}';
     pub const LIST_MUSIC: char = '\u{e2e0}';
@@ -329,16 +322,12 @@ pub mod icon {
     pub const LIST_MINUS: char = '\u{e23e}';
     pub const LIST_CHECKS: char = '\u{e1d0}';
     pub const RADIO: char = '\u{e142}';
-    pub const DISC_3: char = '\u{e494}';
     pub const USER: char = '\u{e19f}';
-    pub const SETTINGS: char = '\u{e154}';
     pub const LOG_OUT: char = '\u{e10e}';
     pub const MUSIC: char = '\u{e122}';
     pub const SPARKLES: char = '\u{e412}';
     pub const CHECK: char = '\u{e06c}';
     pub const CIRCLE_USER: char = '\u{e461}';
-    pub const EXPAND: char = '\u{e21a}';
-    pub const SHRINK: char = '\u{e220}';
     pub const UPLOAD: char = '\u{e19e}';
     pub const USERS: char = '\u{e1a4}';
     pub const COPY: char = '\u{e09e}';

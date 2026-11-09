@@ -512,7 +512,8 @@ pub fn strip(app: &mut App, ui: &mut Ui, now: f64) {
     if let Some(t) = &track {
         named(ui.interact(tr, ui.scope_id().with("mini-title"), Sense::hover()), &t.title).on_hover_text(&t.title);
     }
-    let ar = text_at(ui, pos2(x0, art.top() + 22.0), &artists, theme::regular(12.5), theme::text_dim(), text_w);
+    let subtitle = if hold { &artists } else { app.loading_label().unwrap_or(&artists) };
+    let ar = text_at(ui, pos2(x0, art.top() + 22.0), subtitle, theme::regular(12.5), theme::text_dim(), text_w);
     // The quality glyph follows the artists, centred on their line, when there's room.
     let bw = super::nowplaying::audio_badge_icon_width(app, true);
     if bw > 0.0 && ar.right() + 8.0 + bw <= x1 {
@@ -607,12 +608,13 @@ pub fn strip(app: &mut App, ui: &mut Ui, now: f64) {
         }
         let playing = app.playing();
         let pr = Rect::from_center_size(pos2(cx, cy), Vec2::splat(40.0));
-        let presp = named(ui.interact(pr, ui.scope_id().with("mini-play"), Sense::click()), if playing { "Pause" } else { "Play" }).on_hover_cursor(egui::CursorIcon::PointingHand);
+        let label = app.play_button_label();
+        let presp = named(ui.interact(pr, ui.scope_id().with("mini-play"), Sense::click()), label).on_hover_text(label).on_hover_cursor(egui::CursorIcon::PointingHand);
         let ph = theme::anim_bool(&ctx, presp.id.with("h"), presp.hovered(), 0.15);
         let c = pr.center();
-        let morph = theme::anim_bool(&ctx, "mini-play-morph", playing || app.buffering, 0.18);
+        let morph = theme::anim_bool(&ctx, "mini-play-morph", playing || app.buffering(), 0.18);
         let fg = theme::lerp_color(theme::text_dim(), theme::text(), 0.55 + 0.45 * ph);
-        if app.buffering {
+        if app.buffering() {
             let a = now as f32 * 6.0;
             let pts = (0..20).map(|i| c + vec2((a + i as f32 * 0.22).cos(), (a + i as f32 * 0.22).sin()) * 7.0).collect();
             ui.painter().add(egui::Shape::Path(egui::epaint::PathShape::line(pts, egui::epaint::PathStroke::new(2.0, fg))));

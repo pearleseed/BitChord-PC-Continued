@@ -83,10 +83,6 @@ impl Session {
     pub fn guest(&self) -> bool {
         self.active() && !self.is_host()
     }
-
-    pub fn member_count(&self) -> usize {
-        self.members.len()
-    }
 }
 
 fn my_name(app: &App) -> String {
@@ -324,7 +320,7 @@ fn host_state(app: &App, range: std::ops::Range<usize>, tick: &Tick) -> RoomStat
 
 fn host_send(app: &mut App) {
     // A song still loading has no real position yet: send once it plays.
-    if app.buffering {
+    if app.buffering() {
         return;
     }
     let (range, tick, sig) = host_tick(app);
@@ -447,6 +443,8 @@ fn apply_state(app: &mut App, state: RoomState, at: Instant) {
         app.queue.tracks.clear();
         app.queue.index = None;
         app.jam.loaded = None;
+        app.cancel_loading();
+        app.resume_at = None;
         app.audio.send(AudioCmd::Stop);
         app.jam.last = None;
         return;
@@ -471,6 +469,10 @@ fn sync(app: &mut App) {
         }
     }
     let target = tick.position_at(at);
+    if app.buffering() && !tick.playing {
+        app.cancel_loading();
+        app.jam.loaded = None;
+    }
     if app.jam.loaded.as_deref() != Some(tick.vid.as_str()) || app.resume_at.is_some() {
         if tick.playing {
             // Opened a little ahead: by the time it starts, the host is there.
@@ -483,7 +485,7 @@ fn sync(app: &mut App) {
             app.play_current_at(target + ahead, report);
         } else if app.jam.loaded.as_deref() != Some(tick.vid.as_str()) || app.resume_at != Some(target) {
             // Paused: show the song at the host's position without loading it.
-            app.audio.send(AudioCmd::Stop);
+            app.audio.send(AudioCmd::StopAt(target));
             app.jam.loaded = None;
             app.resume_at = Some(target);
             app.audio.status.position_ms.store(target.as_millis() as u64, Ordering::Relaxed);
@@ -492,7 +494,7 @@ fn sync(app: &mut App) {
         }
         return;
     }
-    if app.buffering {
+    if app.buffering() {
         return;
     }
     if tick.playing != app.playing() {
@@ -511,7 +513,7 @@ fn guest_follow(app: &mut App) {
     // A song we started for the room just began: learn how long that took, and
     // line up with the host.
     if let Some(t) = app.jam.load_started
-        && !app.buffering
+        && !app.buffering()
         && app.playing()
     {
         app.jam.load_started = None;

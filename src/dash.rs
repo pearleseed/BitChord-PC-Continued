@@ -266,6 +266,7 @@ fn downmix(channels: &[Vec<f32>], pcm: &mut Vec<i16>) {
     }
 }
 
+#[cfg(test)]
 fn wav(pcm: &[i16], sample_rate: u32) -> Vec<u8> {
     let data = (pcm.len() * 2) as u32;
     let mut out = Vec::with_capacity(44 + pcm.len() * 2);

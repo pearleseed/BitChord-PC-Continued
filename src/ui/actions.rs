@@ -192,22 +192,13 @@ impl App {
                 if self.logged_in { self.backend.request(Req::SaveCollection { id, save }); }
                 else { self.toast("Sign in to save to library"); }
             }
-            Action::HomeChip(params) => {
-                self.home_loading = true;
-                if let Some(h) = &mut self.home {
-                    h.shelves.clear();
-                    for c in &mut h.chips {
-                        c.selected = false;
-                    }
-                }
-                self.backend.request(Req::Home(params));
-            }
             Action::OpenNowPlaying(open) => {
                 if self.current().is_some() {
                     self.np_open = open;
                 }
             }
             Action::Mini(on) => self.mini.request(on),
+            Action::PlayStandardNow => self.play_standard_now(),
             Action::RevertQuality => {
                 // Mark the playing stream's id (a song version differs from the listed id)
                 // so resolve skips hi-res for it, then replay at the same position.
@@ -219,7 +210,7 @@ impl App {
                 if let Some(listed) = listed.filter(|l| l != &id) {
                     self.backend.revert_quality(&listed);
                 }
-                self.play_current_at(at, false);
+                self.play_with_quality(at, false, crate::backend::PlaybackQuality::Standard);
             }
             Action::UpgradeQuality => {
                 let listed = self.current_id().map(str::to_owned);
@@ -230,7 +221,14 @@ impl App {
                 if let Some(listed) = listed.filter(|l| l != &id) {
                     self.backend.upgrade_quality(&listed);
                 }
-                self.play_current_at(at, false);
+                if self.audio_info.is_none()
+                    && self.resume_at.is_none()
+                    && let Some(track) = self.playing_track().cloned()
+                    && self.backend.try_upgrade_active(self.generation, track)
+                {
+                    return;
+                }
+                self.play_with_quality(at, false, crate::backend::PlaybackQuality::PreferHiRes);
             }
         }
     }
@@ -333,7 +331,7 @@ impl App {
 fn share_url(target: &Target) -> String {
     match target {
         Target::Song(t) => format!("https://music.youtube.com/watch?v={}", t.id),
-        Target::Playlist(id) => format!("https://music.youtube.com/playlist?list={id}"),
+        Target::Playlist(id) => format!("https://music.youtube.com/playlist?list={}", crate::ytm::playlist_id(id)),
         Target::Album(id) => format!("https://music.youtube.com/browse/{id}"),
         Target::Artist(id) => format!("https://music.youtube.com/channel/{id}"),
     }
@@ -348,6 +346,7 @@ mod share_tests {
         let song = Track { id: "abc123".into(), title: String::new(), artists: vec![], album: None, duration: None, thumbs: vec![], track_nr: None, plays: None, music_video: false };
         assert_eq!(share_url(&Target::Song(song)), "https://music.youtube.com/watch?v=abc123");
         assert_eq!(share_url(&Target::Playlist("PL123".into())), "https://music.youtube.com/playlist?list=PL123");
+        assert_eq!(share_url(&Target::Playlist("MPSPPL123".into())), "https://music.youtube.com/playlist?list=PL123");
         assert_eq!(share_url(&Target::Album("MPRE123".into())), "https://music.youtube.com/browse/MPRE123");
         assert_eq!(share_url(&Target::Artist("UC123".into())), "https://music.youtube.com/channel/UC123");
     }

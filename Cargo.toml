@@ -2,6 +2,7 @@
 name = "bitchord"
 version = "2.0.0"
 edition = "2024"
+rust-version = "1.95"
 license = "GPL-3.0-only"
 authors = ["pearle <https://github.com/pearleseed>"]
 repository = "https://github.com/pearleseed/BitChord-PC-Continued"
@@ -9,12 +10,12 @@ description = "Native BitChord client"
 
 [dependencies]
 anyhow = "1.0.104"
-base64 = "0.22.1"
+base64 = "0.23.1"
 bytes = "1.12.1"
 crossbeam-channel = "0.5.17"
 directories = "6.0.0"
 discord-rich-presence = "1.1.0"
-eframe = { version = "0.37", default-features = false, features = ["glow", "wgpu_no_default_features", "default_fonts", "links", "clipboard", "accesskit", "persistence", "wayland", "x11"] }
+eframe = { version = "0.37.0", default-features = false, features = ["glow", "wgpu_no_default_features", "default_fonts", "links", "clipboard", "accesskit", "persistence"] }
 egui = { version = "0.37.0", features = ["monochrome_emoji_fonts"] }
 futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
 egui_extras = { version = "0.37.0", default-features = false, features = ["image"] }
@@ -23,59 +24,67 @@ image = { version = "0.25.10", default-features = false, features = ["jpeg", "pn
 # Dolby Atmos from hi-res addons: E-AC-3 JOC decoded to stereo (dash.rs).
 filmcraft-ac3 = "0.9.0"
 localzone = "0.3.1"
-log = "0.4.34"
-memmap2 = "0.9.11"
-raw-window-handle = "0.6"
-reqwest = { version = "0.12", default-features = false, features = ["default-tls", "gzip", "json", "socks", "http2"] }
-rodio = { version = "0.22.2", default-features = false, features = ["playback", "symphonia-aac", "symphonia-isomp4", "symphonia-flac", "symphonia-alac", "symphonia-wav", "symphonia-mp3", "symphonia-vorbis"] }
+log = "0.4.35"
+memmap2 = "0.9.12"
+# Use the same platform TLS backend as the Jam WebSocket client.
+reqwest = { version = "0.13.5", default-features = false, features = ["native-tls", "gzip", "json", "form", "query", "socks", "http2"] }
+rodio = { version = "0.23.0", default-features = false, features = ["playback", "symphonia-aac", "symphonia-isomp4", "symphonia-flac", "symphonia-alac", "symphonia-wav", "symphonia-mp3", "symphonia-vorbis"] }
 rquickjs = "0.14.0"
-roxmltree = "0.21.1"
+roxmltree = "0.21.2"
 serde = { version = "1.0.229", features = ["derive"] }
+# Share the font parser version used by epaint.
 skrifa = "0.44.0"
-sha1 = "0.10.7"
-sha2 = "0.10.9"
-hmac = "0.12.1"
-serde_json = "1.0.151"
-souvlaki = "0.8.3"
-tao = "0.37.1"
-tokio = { version = "1.53.2", features = ["rt-multi-thread", "macros", "sync", "time"] }
-wry = "0.57.0"
-rfd = "0.17.2"
+sha1 = "0.11.0"
+sha2 = "0.11.1"
+hmac = "0.13.0"
+serde_json = "1.0.154"
+souvlaki = "0.9.3"
+tao = "0.37.2"
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+wry = "0.57.1"
+rfd = "0.18.0"
 tray-icon = "0.26.1"
 url = "2.5.8"
-# The opt-in renderer: Vulkan, Metal on macOS (renderer.rs).
-wgpu = { version = "30.0.1", default-features = false, features = ["std", "parking_lot", "wgsl", "vulkan", "metal"] }
+wgpu = { version = "30.0.1", default-features = false, features = ["std", "parking_lot", "wgsl"] }
 tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["connect", "native-tls"] }
 mp4ameta = "0.13.0"
-md-5 = "0.10"
+md-5 = "0.11.0"
 unicode-normalization = "0.1.26"
+# Share Rodio's Symphonia version for the custom WebM/Opus decoder.
 symphonia = { version = "0.5.5", default-features = false, features = ["mkv"] }
 rusty-opus = "1.0.2"
-unicode-bidi = "0.3"
+unicode-bidi = "0.3.18"
 
 [target.'cfg(windows)'.dependencies]
 # Windows Credential Manager, for the Google and Spotify sign-ins.
 keyring = { version = "3.6.3", features = ["windows-native"] }
+raw-window-handle = "0.6.2"
 windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_Graphics_Dwm", "Win32_Graphics_Gdi", "Win32_Media_MediaFoundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_IO", "Win32_System_Pipes", "Win32_System_Registry", "Win32_UI_Controls", "Win32_UI_HiDpi", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # The Secret Service (GNOME Keyring, KWallet) for the sign-ins.
 keyring = { version = "3.6.3", features = ["sync-secret-service", "crypto-rust"] }
+eframe = { version = "0.37.0", default-features = false, features = ["wayland", "x11"] }
 # The tray icon needs GTK running on a thread of its own.
-gtk = "0.18"
+gtk = "0.18.2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # The login Keychain for the sign-ins.
 keyring = { version = "3.6.3", features = ["apple-native"] }
+wgpu = { version = "30.0.1", default-features = false, features = ["metal"] }
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+wgpu = { version = "30.0.1", default-features = false, features = ["vulkan"] }
 
 [target.'cfg(unix)'.dependencies]
-libc = "0.2"
+libc = "0.2.191"
 
 [profile.release]
-opt-level = 3
-lto = "fat"
-codegen-units = 1
-strip = true
+# Balance compile time and artifact size while keeping cross-crate optimization.
+opt-level = 2
+lto = "thin"
+codegen-units = 4
+strip = "symbols"
 # Unwind, not abort: a panic while handling one request (in a library or a parser)
 # must fail that request, not close the app.
 panic = "unwind"
@@ -85,4 +94,9 @@ panic = "unwind"
 opt-level = 2
 
 [build-dependencies]
-winresource = "0.1.31"
+winresource = "0.1.34"
+
+[patch.crates-io]
+# Souvlaki's macOS backend still uses block 0.1.6. Fix its foreign static
+# declaration until the backend moves to block2.
+block = { path = "vendor/block" }

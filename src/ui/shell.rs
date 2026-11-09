@@ -314,7 +314,7 @@ pub fn sidebar(app: &mut App, ui: &mut Ui) {
                 Target::Playlist(id) => app.playlist_order.iter().position(|x| x == id).unwrap_or(usize::MAX),
                 _ => usize::MAX,
             });
-            let drag_key = egui::Id::new("sidebar-pl-drag");
+            let drag_key = egui::Id::unique("sidebar-pl-drag");
             let dragging: Option<String> = ui.data(|d| d.get_temp(drag_key));
             let down = ui.input(|i| i.pointer.any_down());
             let pointer = ui.input(|i| i.pointer.interact_pos());
@@ -687,7 +687,7 @@ pub fn player_bar(app: &mut App, ui: &mut Ui, now: f64, frosted: bool) {
         // The page scrolls on under this strip: fade it out rather than end it at the
         // player's edge. Clicks in the fade stay with the player, not the rows beneath.
         vgradient(ui.painter(), full, theme::panel(0.0), theme::panel(0.66));
-        ui.interact(full, ui.id().with("player-strip"), Sense::hover());
+        ui.interact(full, ui.scope_id().with("player-strip"), Sense::hover());
     }
     const H: f32 = 56.0;
     let w = (full.width() - 24.0).min(668.0);
@@ -752,11 +752,11 @@ pub fn player_bar(app: &mut App, ui: &mut Ui, now: f64, frosted: bool) {
     if r.clicked() && enabled {
         app.prev();
     }
-    let r = tbtn(ui, mid, "play", if playing { "Pause" } else { "Play" });
+    let r = tbtn(ui, mid, "play", app.play_button_label());
     let h = theme::anim_bool(&ctx, r.id.with("h"), r.hovered(), 0.12);
     let c = r.rect.center();
-    let morph = theme::anim_bool(&ctx, "bar-play-morph", playing || app.buffering, 0.18);
-    if app.buffering {
+    let morph = theme::anim_bool(&ctx, "bar-play-morph", playing || app.buffering(), 0.18);
+    if app.buffering() {
         let a = now as f32 * 6.0;
         let pts: Vec<Pos2> = (0..16).map(|i| c + vec2((a + i as f32 * 0.24).cos(), (a + i as f32 * 0.24).sin()) * 8.0).collect();
         ui.painter().add(egui::Shape::Path(egui::epaint::PathShape::line(pts, egui::epaint::PathStroke::new(2.2, ink(0.6)))));
@@ -888,7 +888,9 @@ pub fn player_bar(app: &mut App, ui: &mut Ui, now: f64, frosted: bool) {
         }
     }
     let mut ax = text_l;
-    if afade > 0.01 && let Some(t) = &track {
+    if !held && let Some(label) = app.loading_label() {
+        text_at(ui, pos2(text_l, cy + 2.0), label, theme::regular(11.5), theme::with_alpha(theme::text_dim(), afade), text_w);
+    } else if afade > 0.01 && let Some(t) = &track {
         for (i, a) in t.artists.iter().enumerate() {
             let s = if i + 1 < t.artists.len() { format!("{}, ", a.name) } else { a.name.clone() };
             let r = text_at(ui, pos2(ax, cy + 2.0), &s, theme::regular(11.5), theme::with_alpha(theme::text_dim(), afade), (text_l + text_w - ax).max(10.0));

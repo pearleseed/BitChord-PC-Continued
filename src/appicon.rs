@@ -9,30 +9,29 @@ use std::path::{Path, PathBuf};
 
 pub struct Variant {
     pub id: &'static str,
-    pub name: &'static str,
     /// An ICO whose entries are PNGs, from 16 to 256 px.
     ico: &'static [u8],
 }
 
 macro_rules! variant {
-    ($id:literal, $name:literal) => {
-        Variant { id: $id, name: $name, ico: include_bytes!(concat!("../assets/icon/variants/", $id, ".ico")) }
+    ($id:literal) => {
+        Variant { id: $id, ico: include_bytes!(concat!("../assets/icon/variants/", $id, ".ico")) }
     };
 }
 
 pub const CLASSIC: &str = "classic";
 
 pub static ALL: &[Variant] = &[
-    Variant { id: CLASSIC, name: "BitChord", ico: include_bytes!("../assets/icon/icon.ico") },
-    variant!("official", "Original"),
-    variant!("smilering", "Smile ring"),
-    variant!("gear", "Rust gear"),
-    variant!("wave", "Waveform"),
-    variant!("vinyl", "Record"),
-    variant!("lyrics", "Lit line"),
-    variant!("duet", "Duet"),
-    variant!("kawarp", "Warp"),
-    variant!("fluent", "Fluent"),
+    Variant { id: CLASSIC, ico: include_bytes!("../assets/icon/icon.ico") },
+    variant!("official"),
+    variant!("smilering"),
+    variant!("gear"),
+    variant!("wave"),
+    variant!("vinyl"),
+    variant!("lyrics"),
+    variant!("duet"),
+    variant!("kawarp"),
+    variant!("fluent"),
 ];
 
 pub fn get(id: &str) -> &'static Variant {
