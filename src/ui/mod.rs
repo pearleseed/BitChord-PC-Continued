@@ -1067,6 +1067,14 @@ impl App {
         Some(widgets::MotionSprite { id: tex.id(), size: tex.size_vec2() })
     }
 
+    pub(crate) fn initialize_ui(mut self, ctx: &egui::Context) -> Self {
+        self.sync_look();
+        let look = self.look();
+        theme::apply_chrome(ctx, look);
+        self.chrome_applied = Some(look.id.clone());
+        self
+    }
+
     fn accent_color(&self) -> Color32 {
         let c = self.look().accent(self.accent);
         if theme::light() {
@@ -1254,9 +1262,6 @@ impl eframe::App for App {
             titlebar::set_content_top(&ctx, chrome.top_inset(&ctx));
         }
         if self.chrome_applied.as_deref() != Some(look.id.as_str()) {
-            if self.chrome_applied.is_none() {
-                ctx.add_texture_loader(Arc::new(crate::images::Textures::default()));
-            }
             theme::apply_chrome(&ctx, look);
             self.chrome_applied = Some(look.id.clone());
         }
@@ -1552,6 +1557,7 @@ impl eframe::App for App {
     }
 
     fn on_exit(&mut self, gl: Option<&eframe::glow::Context>) {
+        self.audio.send(crate::audio::AudioCmd::Shutdown);
         if let (Some(bg), Some(gl)) = (&self.bg, gl) {
             bg.destroy(gl);
         }

@@ -35,6 +35,7 @@ pub enum AudioCmd {
     Pause,
     Resume,
     Stop,
+    Shutdown,
     /// Stop a pending play and keep its position available for a retry.
     StopAt(Duration),
     /// Another song is on its way: with crossfade on, fade this one out instead of
@@ -968,6 +969,12 @@ fn run(
             fading.retain(|f| !f.quality_swap);
         }
         match command {
+            Ok(AudioCmd::Shutdown) => {
+                for stream in shared.iter().chain(fading.iter().filter_map(|f| f.shared.as_ref())) {
+                    stream.cancel();
+                }
+                break;
+            }
             Ok(AudioCmd::Start { generation, decoder, shared: s, at }) => {
                 if generation != status.wanted_gen.load(Ordering::Relaxed) {
                     log::debug!("audio: dropping stale generation {generation}");

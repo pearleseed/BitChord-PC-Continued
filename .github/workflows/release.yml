@@ -1,252 +1,128 @@
 name: Release
+
 on:
   push:
     tags: ["v*.*.*"]
   workflow_dispatch:
-    inputs:
-      version:
-        description: "Version to stamp into the packages, without the leading v"
-        required: true
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
-  linux:
-    name: Linux · AppImage, deb, rpm
-    runs-on: ubuntu-22.04
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Set up JDK 21
-        uses: actions/setup-java@v4
-        with:
-          java-version: '21'
-          distribution: 'temurin'
-
-      - uses: gradle/actions/setup-gradle@v4
-
-      - name: Work out the version
-        id: version
-        run: |
-          version="${{ inputs.version }}"
-          [ -n "$version" ] || version="${GITHUB_REF_NAME#v}"
-          echo "value=$version" >> "$GITHUB_OUTPUT"
-          echo "Building $version"
-
-      - name: Write local.properties
-        run: |
-          echo "LASTFM_API_KEY=${{ secrets.LASTFM_API_KEY }}" > local.properties
-          echo "LASTFM_SECRET=${{ secrets.LASTFM_SECRET }}" >> local.properties
-
-      - name: Packaging tools
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y rpm fakeroot binutils file
-          curl -sSL -o appimagetool.AppImage \
-            https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
-          chmod +x appimagetool.AppImage
-
-      - run: chmod +x gradlew
-
-      - name: Tests
-        run: ./gradlew :shared:jvmTest :desktopApp:test -Pbitchord.version=${{ steps.version.outputs.value }}
-
-      - name: Build deb, rpm and the app image
-        run: |
-          ./gradlew :desktopApp:packageDeb :desktopApp:packageRpm :desktopApp:createDistributable \
-            -Pbitchord.version=${{ steps.version.outputs.value }}
-
-      - name: The analyser and models are in the jar
-        run: |
-          jar=$(ls desktopApp/build/compose/binaries/main/app/BitChord/lib/app/desktopApp*.jar)
-          jar tf "$jar" | grep -q 'native/libbitchord_analysis.so'
-          jar tf "$jar" | grep -q 'models/.*\.onnx'
-
-      - name: Build the AppImage
-        run: |
-          desktopApp/packaging/appimage.sh \
-            desktopApp/build/compose/binaries/main/app/BitChord \
-            dist/BitChord-${{ steps.version.outputs.value }}-linux-x86_64.AppImage \
-            "$PWD/appimagetool.AppImage"
-
-      - name: Collect
-        run: |
-          v=${{ steps.version.outputs.value }}
-          mkdir -p dist
-          cp desktopApp/build/compose/binaries/main/deb/*.deb "dist/BitChord-$v-linux-amd64.deb"
-          cp desktopApp/build/compose/binaries/main/rpm/*.rpm "dist/BitChord-$v-linux-x86_64.rpm"
-          ls -lh dist
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: linux-artifacts
-          path: dist/*
-
-  windows:
-    name: Windows · installer, msi, portable
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Set up JDK 21
-        uses: actions/setup-java@v4
-        with:
-          java-version: '21'
-          distribution: 'temurin'
-
-      - uses: gradle/actions/setup-gradle@v4
-
-      - name: WiX Toolset 3
-        shell: pwsh
-        run: |
-          $url = "https://github.com/wixtoolset/wix3/releases/download/wix3141rtm/wix314-binaries.zip"
-          Invoke-WebRequest -Uri $url -OutFile wix.zip
-          Expand-Archive wix.zip -DestinationPath "$env:RUNNER_TEMP\wix"
-          "$env:RUNNER_TEMP\wix" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-
-      - name: CMake version
-        run: cmake --version
-
-      - name: Work out the version
-        id: version
-        shell: bash
-        run: |
-          version="${{ inputs.version }}"
-          [ -n "$version" ] || version="${GITHUB_REF_NAME#v}"
-          echo "value=$version" >> "$GITHUB_OUTPUT"
-          echo "Building $version"
-
-      - name: Write local.properties
-        shell: bash
-        run: |
-          echo "LASTFM_API_KEY=${{ secrets.LASTFM_API_KEY }}" > local.properties
-          echo "LASTFM_SECRET=${{ secrets.LASTFM_SECRET }}" >> local.properties
-
-      - name: Tests
-        run: .\gradlew.bat :shared:jvmTest :desktopApp:test "-Pbitchord.version=${{ steps.version.outputs.value }}"
-
-      - name: Build msi, exe and the app image
-        run: |
-          .\gradlew.bat :desktopApp:packageMsi :desktopApp:packageExe :desktopApp:createDistributable "-Pbitchord.version=${{ steps.version.outputs.value }}"
-
-      - name: The analyser and models are in the jar
-        shell: bash
-        run: |
-          jar=$(ls desktopApp/build/compose/binaries/main/app/BitChord/app/desktopApp*.jar)
-          jar tf "$jar" | grep -q 'native/bitchord_analysis.dll'
-          jar tf "$jar" | grep -q 'models/.*\.onnx'
-          # WinRT, so only MSVC can build it and only this job ever does.
-          jar tf "$jar" | grep -q 'native/bitchord_smtc.dll'
-
-      - name: Collect
-        shell: pwsh
-        run: |
-          $v = "${{ steps.version.outputs.value }}"
-          New-Item -ItemType Directory -Force dist | Out-Null
-          Copy-Item desktopApp/build/compose/binaries/main/msi/*.msi "dist/BitChord-$v-windows-x64.msi"
-          Copy-Item desktopApp/build/compose/binaries/main/exe/*.exe "dist/BitChord-$v-windows-x64-setup.exe"
-          7z a -tzip -mx=5 "dist/BitChord-$v-windows-x64-portable.zip" `
-            "desktopApp/build/compose/binaries/main/app/BitChord/*" | Out-Null
-          Get-ChildItem dist | Format-Table Name, Length
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: windows-artifacts
-          path: dist/*
-
-  macos:
-    name: macOS · dmg, pkg, zip (${{ matrix.arch }})
+  package:
+    name: Package · ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         include:
-          - os: macos-14
-            arch: arm64
+          - os: macos-15
+            arch: aarch64
           - os: macos-15-intel
-            arch: x64
+            arch: x86_64
+          - os: ubuntu-24.04
+            arch: x86_64
+          - os: windows-latest
+            arch: x86_64
     runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v4
-
-      - name: Set up JDK 21
-        uses: actions/setup-java@v4
-        with:
-          java-version: '21'
-          distribution: 'temurin'
-
-      - uses: gradle/actions/setup-gradle@v4
-
-      - name: Work out the version
+      - run: rustup update stable --no-self-update
+      - name: Read the version from Cargo
         id: version
+        env:
+          REF_NAME: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
         run: |
-          version="${{ inputs.version }}"
-          [ -n "$version" ] || version="${GITHUB_REF_NAME#v}"
+          version=$(cargo +stable metadata --locked --no-deps --format-version 1 | jq -r '.packages[0].version')
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          if [[ "$REF_TYPE" == tag && "$REF_NAME" != "v$version" ]]; then
+            echo "Tag $REF_NAME must match Cargo version $version" >&2
+            exit 1
+          fi
           echo "value=$version" >> "$GITHUB_OUTPUT"
-          echo "Building $version"
-
-      - name: Write local.properties
+      - name: Install Linux development libraries
+        if: runner.os == 'Linux'
         run: |
-          echo "LASTFM_API_KEY=${{ secrets.LASTFM_API_KEY }}" > local.properties
-          echo "LASTFM_SECRET=${{ secrets.LASTFM_SECRET }}" >> local.properties
-
-      - run: chmod +x gradlew
-
-      - name: Tests
-        run: ./gradlew :shared:jvmTest :desktopApp:test -Pbitchord.version=${{ steps.version.outputs.value }}
-
-      - name: Build DMG, PKG and the app bundle
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev libgtk-3-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev libxdo-dev libssl-dev
+      - name: Test
+        run: cargo +stable test --locked
+      - name: Build
+        env:
+          LASTFM_API_KEY: ${{ secrets.LASTFM_API_KEY }}
+          LASTFM_SECRET: ${{ secrets.LASTFM_SECRET }}
         run: |
-          ./gradlew :desktopApp:packageDmg :desktopApp:packagePkg :desktopApp:createDistributable \
-            -Pbitchord.version=${{ steps.version.outputs.value }}
-
-      - name: The analyser and models are in the jar
+          if [[ -z "$LASTFM_API_KEY" || -z "$LASTFM_SECRET" ]]; then
+            echo "::warning::This release build will show Last.fm as unconfigured."
+          fi
+          cargo +stable build --release --locked
+      - name: Package macOS
+        if: runner.os == 'macOS'
+        env:
+          VERSION: ${{ steps.version.outputs.value }}
+          ARCH: ${{ matrix.arch }}
         run: |
-          jar=$(ls desktopApp/build/compose/binaries/main/app/BitChord.app/Contents/app/desktopApp*.jar)
-          jar tf "$jar" | grep -q 'models/.*\.onnx'
-
-      - name: Collect
-        run: |
-          v="${{ steps.version.outputs.value }}"
-          arch="${{ matrix.arch }}"
           mkdir -p dist
-          for f in desktopApp/build/compose/binaries/main/dmg/*.dmg; do
-            [ -f "$f" ] && cp "$f" "dist/BitChord-$v-macos-$arch.dmg"
-          done
-          for f in desktopApp/build/compose/binaries/main/pkg/*.pkg; do
-            [ -f "$f" ] && cp "$f" "dist/BitChord-$v-macos-$arch.pkg"
-          done
-          ditto -c -k --keepParent desktopApp/build/compose/binaries/main/app/BitChord.app "dist/BitChord-$v-macos-$arch.zip"
-          ls -lh dist
-
+          macos/bundle.sh target/release/bitchord "$VERSION" installed
+          macos/bundle.sh target/release/bitchord "$VERSION" portable portable
+          hdiutil create -quiet -fs HFS+ -volname BitChord -srcfolder installed "dist/bitchord-setup-$VERSION-macos-$ARCH.dmg"
+          ditto -c -k --keepParent portable/bitchord.app "dist/bitchord-portable-$VERSION-macos-$ARCH.zip"
+      - name: Package Linux
+        if: runner.os == 'Linux'
+        env:
+          VERSION: ${{ steps.version.outputs.value }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          mkdir -p dist bitchord
+          cp target/release/bitchord linux/install.sh linux/bitchord.desktop README.md LICENSE bitchord/
+          cp assets/icon/icon.png bitchord/bitchord.png
+          tar -czf "dist/bitchord-$VERSION-linux-$ARCH.tar.gz" bitchord
+          cp linux/portable.txt bitchord/
+          tar -czf "dist/bitchord-portable-$VERSION-linux-$ARCH.tar.gz" bitchord
+      - name: Package Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          VERSION: ${{ steps.version.outputs.value }}
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (!(Test-Path $iscc)) { choco install innosetup --yes --no-progress }
+          & $iscc "/DAppVersion=$env:VERSION" installer/bitchord.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          New-Item -ItemType Directory dist, portable
+          Copy-Item installer/Output/*.exe dist/
+          Copy-Item target/release/bitchord.exe, installer/portable.txt, README.md, LICENSE portable/
+          Compress-Archive -Path portable/* -DestinationPath "dist/bitchord-portable-$env:VERSION.zip"
       - uses: actions/upload-artifact@v4
         with:
-          name: macos-${{ matrix.arch }}-artifacts
+          name: ${{ matrix.os }}-artifacts
           path: dist/*
+          if-no-files-found: error
 
-  release:
-    name: Publish
-    needs: [linux, windows, macos]
-    runs-on: ubuntu-latest
+  draft:
+    name: Draft GitHub release
+    if: github.ref_type == 'tag'
+    needs: package
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
     steps:
       - uses: actions/download-artifact@v4
         with:
           pattern: "*-artifacts"
           merge-multiple: true
           path: dist
-
-      - run: ls -lh dist
-
-      - name: Draft the release
-        if: github.ref_type == 'tag'
-        uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
           name: BitChord ${{ github.ref_name }}
           draft: true
           files: dist/*
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          fail_on_unmatched_files: true

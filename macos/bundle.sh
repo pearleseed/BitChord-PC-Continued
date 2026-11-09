@@ -1,39 +1,71 @@
 #!/bin/sh
-# Make bitchord.app from a built binary:
-#   macos/bundle.sh target/release/bitchord 0.2.24 out [portable]
-# With `portable`, the app keeps its data in a folder beside itself (see portable.txt).
-# The app is signed ad hoc (there's no Developer ID), so macOS asks before its first
-# launch: right-click it and pick Open, or run `xattr -dr com.apple.quarantine bitchord.app`.
-set -e
+# macos/bundle.sh target/release/bitchord 2.0.0 out [portable]
+set -eu
 
+if [ "$#" -lt 3 ] || [ "$#" -gt 4 ]; then
+    echo "usage: $0 <binary> <version> <out dir> [portable]" >&2
+    exit 2
+fi
 bin=$1
 version=$2
 out=$3
-kind=$4
-[ -n "$bin" ] && [ -n "$version" ] && [ -n "$out" ] || { echo "usage: $0 <binary> <version> <out dir>"; exit 1; }
+kind=${4:-}
+case "$kind" in
+    ""|portable) ;;
+    *) echo "unknown bundle kind: $kind" >&2; exit 2 ;;
+esac
+if ! printf '%s\n' "$version" | LC_ALL=C grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+    echo "expected a three-component numeric bundle version" >&2
+    exit 2
+fi
+[ -f "$bin" ] || { echo "binary not found: $bin" >&2; exit 1; }
+
 here=$(cd "$(dirname "$0")" && pwd)
 icon="$here/../assets/icon/macos.png"
-[ -f "$icon" ] || icon="$here/../assets/icon/icon.png"
 app="$out/bitchord.app"
 
-rm -rf "$app"
-mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
-cp "$bin" "$app/Contents/MacOS/bitchord"
-chmod 755 "$app/Contents/MacOS/bitchord"
-sed "s/@VERSION@/$version/g" "$here/Info.plist" > "$app/Contents/Info.plist"
+mkdir -p "$out"
+stage=$(mktemp -d "$out/.bitchord-stage.XXXXXX")
+# A failed build leaves the old bundle in place.
+trap 'rm -rf "$stage"' EXIT
+bundle="$stage/bitchord.app"
+mkdir -p "$bundle/Contents/MacOS" "$bundle/Contents/Resources"
+cp "$bin" "$bundle/Contents/MacOS/bitchord"
+chmod 755 "$bundle/Contents/MacOS/bitchord"
+sed "s/@VERSION@/$version/g" "$here/Info.plist" > "$bundle/Contents/Info.plist"
+plutil -lint "$bundle/Contents/Info.plist" >/dev/null
 
-# The Dock and Finder icon, at each size iconutil takes up to 1024 px (512@2x).
-tmp=$(mktemp -d)
-trap 'rm -rf "$tmp"' EXIT
-set=$tmp/bitchord.iconset
-mkdir "$set"
-for spec in 16:16x16 32:16x16@2x 32:32x32 64:32x32@2x 128:128x128 256:128x128@2x 256:256x256 512:256x256@2x 512:512x512 1024:512x512@2x; do
-    sips -z "${spec%%:*}" "${spec%%:*}" "$icon" --out "$set/icon_${spec#*:}.png" >/dev/null
+iconset="$stage/bitchord.iconset"
+mkdir "$iconset"
+for pixels in 16 32 64 128 256 512 1024; do
+    sips -z "$pixels" "$pixels" "$icon" --out "$stage/$pixels.png" >/dev/null
 done
-iconutil -c icns "$set" -o "$app/Contents/Resources/bitchord.icns"
+for spec in 16:16x16 32:16x16@2x 32:32x32 64:32x32@2x 128:128x128 256:128x128@2x 256:256x256 512:256x256@2x 512:512x512 1024:512x512@2x; do
+    cp "$stage/${spec%%:*}.png" "$iconset/icon_${spec#*:}.png"
+done
+iconutil -c icns "$iconset" -o "$bundle/Contents/Resources/bitchord.icns"
 
-# Before signing: the signature seals everything in Resources.
-[ "$kind" = portable ] && cp "$here/portable.txt" "$app/Contents/Resources/portable.txt"
+if [ "$kind" = portable ]; then
+    cp "$here/portable.txt" "$bundle/Contents/Resources/portable.txt"
+fi
+if [ -n "${BITCHORD_SIGN_IDENTITY:-}" ]; then
+    codesign --force --options runtime --timestamp --sign "$BITCHORD_SIGN_IDENTITY" "$bundle"
+else
+    codesign --force --sign - "$bundle"
+fi
+codesign --verify --strict "$bundle"
 
-codesign --force --sign - "$app"
+# Replace only after the entire new bundle has been validated.
+if [ -e "$app" ]; then
+    mv "$app" "$stage/previous.app"
+fi
+if ! mv "$bundle" "$app"; then
+    if [ -e "$stage/previous.app" ]; then
+        mv "$stage/previous.app" "$app" || {
+            trap - EXIT
+            echo "previous bundle preserved at $stage/previous.app" >&2
+        }
+    fi
+    exit 1
+fi
 echo "Made $app"

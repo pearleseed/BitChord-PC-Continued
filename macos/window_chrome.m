@@ -1,4 +1,6 @@
 #import <AppKit/AppKit.h>
+#import <CoreText/CoreText.h>
+#include <stdbool.h>
 
 typedef void (*ChromeWake)(const void *);
 
@@ -307,4 +309,15 @@ void bitchord_chrome_history(void *handle, double x, double y, double width, dou
     chrome.back.enabled = (enabled & 1) != 0;
     chrome.forward.enabled = (enabled & 2) != 0;
     chrome.history.hidden = NO;
+}
+
+bool bitchord_system_font_path(unsigned char *buffer, size_t capacity) {
+    CTFontRef font = CTFontCreateUIFontForLanguage(kCTFontUIFontSystem, 20, NULL);
+    if (!font) return false;
+    CFURLRef url = CTFontCopyAttribute(font, kCTFontURLAttribute);
+    CFRelease(font);
+    if (!url) return false;
+    Boolean copied = CFURLGetFileSystemRepresentation(url, true, buffer, capacity);
+    CFRelease(url);
+    return copied;
 }

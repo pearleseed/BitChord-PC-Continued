@@ -66,12 +66,24 @@ impl App {
                 Err(e) => self.toast(format!("Last.fm sign-in failed: {e}")),
             }
         }
-        if self.lastfm_user.is_none() {
+        if self.lastfm_user.is_none() || !crate::lastfm::configured() {
             return;
         }
         let Some(t) = self.playing_track().filter(|_| self.playing() && !self.buffering()) else { return };
         let pos = self.audio.status.position();
         let dur = Duration::from_millis(self.audio.status.duration_ms.load(Ordering::Relaxed));
+        let first = self.scrobble.is_none_or(|(generation, _)| generation != self.generation);
+        let due = dur >= Duration::from_secs(30)
+            && pos >= (dur / 2).min(Duration::from_secs(240))
+            && self.scrobble.is_some_and(|(_, done)| !done);
+        if !first && !due {
+            return;
+        }
+        let Some(epoch) = crate::lastfm::session_epoch() else {
+            self.lastfm_user = None;
+            self.scrobble = None;
+            return;
+        };
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
         let play = crate::lastfm::Scrobble {
             artist: t.artists.first().map(|a| a.name.clone()).unwrap_or_default(),
@@ -84,15 +96,11 @@ impl App {
             return;
         }
         let http = self.backend.http();
-        if self.scrobble.is_none_or(|(g, _)| g != self.generation) {
-            self.scrobble = Some((self.generation, false));
-            let p = play.clone();
-            self.backend.spawn(async move { crate::lastfm::now_playing(&http, &p).await });
-            return;
-        }
-        if dur >= Duration::from_secs(30) && pos >= (dur / 2).min(Duration::from_secs(240)) && self.scrobble.is_some_and(|(_, done)| !done) {
-            self.scrobble = Some((self.generation, true));
-            self.backend.spawn(async move { crate::lastfm::scrobble(&http, play).await });
+        self.scrobble = Some((self.generation, !first));
+        if first {
+            self.backend.spawn(async move { crate::lastfm::now_playing(&http, epoch, &play).await });
+        } else {
+            self.backend.spawn(async move { crate::lastfm::scrobble(&http, epoch, play).await });
         }
     }
 

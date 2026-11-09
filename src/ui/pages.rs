@@ -1627,7 +1627,9 @@ fn settings_connections(app: &mut App, ui: &mut Ui) {
         });
         divider(ui);
         let busy = app.lastfm_busy.load(Ordering::Relaxed);
+        let configured = crate::lastfm::configured();
         let desc = match &app.lastfm_user {
+            _ if !configured => "Last.fm credentials are required for this build.".to_owned(),
             Some(name) => format!("Scrobbling what you play to {name}'s profile."),
             None if busy => "Allow BitChord on the Last.fm page that opened in your browser.".to_owned(),
             None => "Scrobble what you play to your Last.fm profile.".to_owned(),
@@ -1638,7 +1640,7 @@ fn settings_connections(app: &mut App, ui: &mut Ui) {
                 disconnect = pill(ui, "Disconnect", None, false).clicked();
             } else if busy {
                 ui.spinner();
-            } else {
+            } else if configured {
                 connect = pill(ui, "Connect", None, false).clicked();
             }
         });

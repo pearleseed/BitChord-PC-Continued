@@ -1,5 +1,6 @@
 //! AppKit controls on the main eframe view. The renderer and navigation model stay in Rust.
 
+use std::cell::Cell;
 use std::ffi::{c_int, c_uint, c_void};
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -16,6 +17,7 @@ unsafe extern "C" {
     fn bitchord_chrome_top_inset(handle: *mut c_void) -> f64;
     fn bitchord_chrome_set_compact(handle: *mut c_void, compact: c_int);
     fn bitchord_chrome_appearance(handle: *mut c_void, appearance: c_int);
+    fn bitchord_system_font_path(buffer: *mut u8, capacity: usize) -> bool;
     fn bitchord_chrome_preferences() -> c_uint;
     fn bitchord_chrome_take_history(handle: *mut c_void) -> c_uint;
     fn bitchord_chrome_history(
@@ -28,11 +30,19 @@ unsafe extern "C" {
     );
 }
 
+#[derive(Clone, Copy, PartialEq)]
+struct HistoryLayout {
+    rect: [f64; 4],
+    viewport_size: egui::Vec2,
+    enabled: c_uint,
+}
+
 /// Main-thread-only owner of the native controls and their repaint callback.
 pub struct Chrome {
     handle: NonNull<c_void>,
     _wake_context: Box<egui::Context>,
     appearance: Option<c_int>,
+    history_layout: Cell<Option<HistoryLayout>>,
 }
 
 impl Chrome {
@@ -55,6 +65,7 @@ impl Chrome {
             handle,
             _wake_context: context,
             appearance: None,
+            history_layout: Cell::new(None),
         })
     }
 
@@ -64,6 +75,7 @@ impl Chrome {
     }
 
     pub fn set_compact(&self, compact: bool) {
+        self.history_layout.set(None);
         unsafe { bitchord_chrome_set_compact(self.handle.as_ptr(), compact.into()) };
     }
 
@@ -91,7 +103,8 @@ impl Chrome {
         back: bool,
         forward: bool,
     ) {
-        let origin = ctx.viewport_rect().min;
+        let viewport = ctx.viewport_rect();
+        let origin = viewport.min;
         let zoom = f64::from(ctx.zoom_factor());
         let (x, y, w, h) = rect.map_or((0.0, 0.0, 0.0, 0.0), |r| {
             (
@@ -102,7 +115,10 @@ impl Chrome {
             )
         });
         let enabled = c_uint::from(back) | (c_uint::from(forward) << 1);
-        unsafe { bitchord_chrome_history(self.handle.as_ptr(), x, y, w, h, enabled) };
+        let layout = HistoryLayout { rect: [x, y, w, h], viewport_size: viewport.size(), enabled };
+        if self.history_layout.replace(Some(layout)) != Some(layout) {
+            unsafe { bitchord_chrome_history(self.handle.as_ptr(), x, y, w, h, enabled) };
+        }
     }
 }
 
@@ -128,4 +144,19 @@ pub fn refresh_preferences() -> bool {
 
 pub fn preferences() -> u32 {
     PREFERENCES.load(Ordering::Relaxed)
+}
+
+/// CoreText locates the active system font, whose path varies by macOS version.
+pub(crate) fn system_font_path() -> Option<std::path::PathBuf> {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let mut path = [0u8; libc::PATH_MAX as usize];
+    // SAFETY: the caller supplies a writable buffer and native code writes a
+    // nul-terminated file system path only when it fits.
+    if !unsafe { bitchord_system_font_path(path.as_mut_ptr(), path.len()) } {
+        return None;
+    }
+    let end = path.iter().position(|b| *b == 0)?;
+    Some(OsStr::from_bytes(&path[..end]).into())
 }

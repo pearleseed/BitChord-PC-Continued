@@ -6,13 +6,14 @@
 //! moved or deleted just stops counting as downloaded.
 
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, LazyLock, RwLock};
+use std::sync::{Arc, LazyLock, Mutex, RwLock};
 
 use serde::{Deserialize, Serialize};
 
 use crate::model::Track;
-use crate::stream::Shared;
+use crate::stream::{Format, Shared};
 
 #[derive(Clone, Serialize, Deserialize)]
 struct Entry {
@@ -26,6 +27,15 @@ struct Entry {
     /// The song as it was downloaded, for the Downloads page.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     song: Option<Track>,
+}
+
+impl Entry {
+    fn open(&self) -> Option<Arc<Shared>> {
+        let data = std::fs::read(&self.path).ok()?;
+        // Legacy entries have no format field. Sniff the EBML signature for WebM.
+        let format = if data.starts_with(&[0x1a, 0x45, 0xdf, 0xa3]) { Format::Opus } else { Format::Aac };
+        Some(Shared::from_bytes_with_format(data, self.duration_ms, self.loudness_db, format, None))
+    }
 }
 
 struct State {
@@ -49,7 +59,18 @@ pub fn default_folder() -> PathBuf {
 /// Load the index; `folder` is the saved setting (empty for the default).
 pub fn init(data_dir: &Path, folder: &str) {
     let file = data_dir.join("downloads.json");
-    let index = std::fs::read(&file).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+    let index = match std::fs::read(&file) {
+        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|error| {
+            log::warn!("could not read download index {}: {error}", file.display());
+            HashMap::new()
+        }),
+        Err(error) => {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                log::warn!("could not read download index {}: {error}", file.display());
+            }
+            HashMap::new()
+        }
+    };
     let mut st = STATE.write().unwrap();
     st.index = index;
     st.file = file;
@@ -143,48 +164,66 @@ pub fn song_for(video_id: &str) -> Option<Track> {
 /// A downloaded song's audio, as a complete stream buffer for playback.
 pub fn open(video_id: &str) -> Option<Arc<Shared>> {
     let entry = STATE.read().unwrap().index.get(video_id).cloned()?;
-    let data = std::fs::read(&entry.path).ok()?;
+    let audio = entry.open()?;
     log::info!("{video_id}: playing the downloaded file");
-    Some(Shared::from_bytes(data, entry.duration_ms, entry.loudness_db))
+    Some(audio)
 }
 
 /// Write a downloaded song into the folder and remember it. Returns the file.
 /// `stands_for`: the music video `t` is the song version of.
-pub fn save(t: &Track, audio: &[u8], duration_ms: u64, loudness_db: Option<f32>, cover: Option<Vec<u8>>, stands_for: Option<String>) -> anyhow::Result<PathBuf> {
-    let folder = folder();
+pub fn save(t: &Track, mut audio: Vec<u8>, duration_ms: u64, loudness_db: Option<f32>, cover: Option<Vec<u8>>, stands_for: Option<String>) -> anyhow::Result<PathBuf> {
+    // File naming and index publication are one transaction for concurrent saves.
+    static SAVING: Mutex<()> = Mutex::new(());
+    let _save = SAVING.lock().unwrap();
+    let (folder, index_file, mut index) = {
+        let st = STATE.read().unwrap();
+        (st.folder.clone(), st.file.clone(), st.index.clone())
+    };
     std::fs::create_dir_all(&folder)?;
     let ext = if audio.get(4..8) == Some(b"ftyp") { "m4a" } else { "webm" };
-    // A file already there for this song is replaced; another song's isn't.
-    let mine = STATE.read().unwrap().index.get(&t.id).map(|e| e.path.clone());
+    let mine = index.get(&t.id).map(|e| &e.path);
     let stem = file_stem(t);
     let mut path = folder.join(format!("{stem}.{ext}"));
     let mut n = 2;
-    while path.exists() && Some(&path) != mine.as_ref() {
+    while path.exists() && Some(&path) != mine {
         path = folder.join(format!("{stem} ({n}).{ext}"));
         n += 1;
     }
-    let part = path.with_extension(format!("{ext}.part"));
-    // YouTube's files say they're DASH segments ("dash" brand); as a file of its own,
-    // call it audio, which some players and Explorer go by.
-    let mut audio = audio.to_vec();
+    let replace = Some(&path) == mine;
+
+    let mut part = tempfile::NamedTempFile::new_in(&folder)?;
+    // Change YouTube's DASH brand to M4A for players that rely on it.
     if audio.get(8..12) == Some(b"dash") {
         audio[8..12].copy_from_slice(b"M4A ");
     }
-    std::fs::write(&part, &audio)?;
-    if ext == "m4a"
-        && let Err(e) = tag(&part, t, cover)
-    {
-        // Untagged audio still plays; keep it.
+    part.write_all(&audio)?;
+    drop(audio);
+    if ext == "m4a" && let Err(e) = tag(part.path(), t, cover) {
         log::warn!("couldn't tag {}: {e:#}", path.display());
     }
-    std::fs::rename(&part, &path)?;
-    let mut st = STATE.write().unwrap();
-    // Every entry keeps its song, so the Downloads page can list it later.
-    let song = Some(t.clone());
-    st.index.insert(t.id.clone(), Entry { path: path.clone(), duration_ms, loudness_db, stands_for, song });
-    if let Ok(json) = serde_json::to_vec(&st.index) {
-        let _ = std::fs::write(&st.file, json);
+
+    index.insert(t.id.clone(), Entry {
+        path: path.clone(), duration_ms, loudness_db, stands_for, song: Some(t.clone()),
+    });
+    let index_dir = index_file.parent().ok_or_else(|| anyhow::anyhow!("download index is not initialized"))?;
+    let mut new_index = tempfile::NamedTempFile::new_in(index_dir)?;
+    serde_json::to_writer(&mut new_index, &index)?;
+    new_index.as_file().sync_all()?;
+
+    if replace {
+        part.persist(&path)?;
+    } else {
+        part.persist_noclobber(&path)?;
     }
+    if let Err(error) = new_index.persist(index_file) {
+        // The old index still points to an existing replacement. For a new entry,
+        // remove the unpublished file so a retry uses the same filename.
+        if !replace {
+            let _ = std::fs::remove_file(&path);
+        }
+        return Err(error.into());
+    }
+    STATE.write().unwrap().index = index;
     Ok(path)
 }
 
@@ -233,6 +272,44 @@ fn tag(path: &Path, t: &Track, cover: Option<Vec<u8>>) -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use crate::model::Link;
+
+    #[test]
+    fn old_download_index_reopens_webm_as_opus() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("download.webm");
+        std::fs::write(&path, [0x1a, 0x45, 0xdf, 0xa3]).unwrap();
+        let entry: Entry = serde_json::from_value(serde_json::json!({
+            "path": path, "duration_ms": 3200, "loudness_db": -2.0
+        })).unwrap();
+        let audio = entry.open().unwrap();
+        assert_eq!(audio.format, crate::stream::Format::Opus);
+        assert_eq!(audio.duration_ms, 3200);
+        assert_eq!(audio.loudness_db, Some(-2.0));
+        assert_eq!(audio.bytes().unwrap(), [0x1a, 0x45, 0xdf, 0xa3]);
+    }
+
+    #[test]
+    fn concurrent_saves_keep_distinct_files_and_both_index_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let music = dir.path().join("music");
+        init(dir.path(), music.to_str().unwrap());
+        let track = |id: &str| Track {
+            id: id.into(), title: "Shared title".into(), artists: vec![], album: None,
+            duration: None, thumbs: vec![], track_nr: None, plays: None, music_video: false,
+        };
+        let paths = std::thread::scope(|scope| {
+            let one = scope.spawn(|| save(&track("one"), vec![1], 0, None, None, None).unwrap());
+            let two = scope.spawn(|| save(&track("two"), vec![2], 0, None, None, None).unwrap());
+            [one.join().unwrap(), two.join().unwrap()]
+        });
+        assert_ne!(paths[0], paths[1]);
+        assert_eq!(std::fs::read(&paths[0]).unwrap(), [1]);
+        assert_eq!(std::fs::read(&paths[1]).unwrap(), [2]);
+        let index: HashMap<String, Entry> =
+            serde_json::from_slice(&std::fs::read(dir.path().join("downloads.json")).unwrap()).unwrap();
+        assert_eq!(index["one"].path, paths[0]);
+        assert_eq!(index["two"].path, paths[1]);
+    }
 
     #[test]
     fn file_names_are_safe_on_windows() {

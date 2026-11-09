@@ -1,13 +1,61 @@
-/target
+# Rust & Cargo build artifacts
+.cargo/
+target/
+target-bisect/
+**/*.rs.bk
+*.profraw
+*.profdata
 
+# Distribution & packaging outputs
+dist/
 installer/Output/
+/installed/
+/portable/
+/bitchord/
+*.app/
+*.dmg
+*.pkg
+
+# Environment & secrets
+.env
+.env.*
+!.env.example
+!.env.template
+
+# Node / Server / Cloudflare Workers
+node_modules/
+.wrangler/
+server/build/
+
+# Application logs & local portable data
+*.log
+ytm-rs.log
+/data/
+
+# Operating system files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_vista.db
+[Dd]esktop.ini
+
+# IDEs & editors
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+*.swp
+*.swo
+*~
+*.bak
+
+# AI & developer tooling
 .claude/
 .superpowers/
-
-server/target/
-server/smoke/target/
-server/build/
-server/.wrangler/
-server/node_modules/
 .playwright-cli/
-target-bisect/
+.gemini/

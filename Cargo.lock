@@ -561,6 +561,7 @@ dependencies = [
  "souvlaki",
  "symphonia",
  "tao",
+ "tempfile",
  "tokio",
  "tokio-tungstenite",
  "tray-icon",

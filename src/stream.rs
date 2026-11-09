@@ -155,12 +155,6 @@ impl Shared {
         })
     }
 
-    /// A buffer that already holds the whole file (a downloaded song).
-    pub fn from_bytes(data: Vec<u8>, duration_ms: u64, loudness_db: Option<f32>) -> Arc<Self> {
-        // Saved songs are AAC (downloads take that stream).
-        Self::from_bytes_with_format(data, duration_ms, loudness_db, Format::Aac, None)
-    }
-
     /// A buffer that's already whole, in whatever container it was decoded to.
     pub fn from_bytes_with_format(data: Vec<u8>, duration_ms: u64, loudness_db: Option<f32>, format: Format, info: Option<crate::hires::Info>) -> Arc<Self> {
         let total = data.len() as u64;
@@ -355,15 +349,31 @@ impl UrlSlot {
     }
 }
 
+/// Wake blocking readers if the runtime drops the download before it finishes.
+struct DownloadCompletion<'a> {
+    shared: &'a Shared,
+    finished: bool,
+}
+
+impl Drop for DownloadCompletion<'_> {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.shared.cancel();
+        }
+        self.shared.done.send_replace(true);
+    }
+}
+
 /// Download into `shared` with parallel range requests; returns when complete,
 /// failed, or every reader was dropped.
 pub async fn download(http: reqwest::Client, url: String, ua: String, shared: Arc<Shared>, refresh: Option<Refresh>, ranging: Ranging) {
+    let mut completion = DownloadCompletion { shared: &shared, finished: false };
     tokio::select! {
         biased;
         _ = shared.cancelled() => {}
         _ = download_stream(http, url, ua, shared.clone(), refresh, ranging) => {}
     }
-    shared.done.send_replace(true);
+    completion.finished = true;
 }
 
 async fn download_stream(http: reqwest::Client, url: String, ua: String, shared: Arc<Shared>, refresh: Option<Refresh>, ranging: Ranging) {
@@ -838,6 +848,14 @@ mod tests {
             size: 1,
             duration_ms: 1,
         }
+    }
+
+    #[test]
+    fn abandoning_download_marks_buffer_cancelled_and_done() {
+        let shared = Shared::new(BLOCK, 0, None, Format::Aac, None, false);
+        drop(DownloadCompletion { shared: &shared, finished: false });
+        assert!(shared.inner.lock().unwrap().cancelled);
+        assert!(*shared.done.borrow());
     }
 
     #[test]

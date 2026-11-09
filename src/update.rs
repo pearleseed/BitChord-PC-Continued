@@ -23,9 +23,9 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-const LATEST: &str = "https://api.github.com/repos/grapedjuice/ytm-rs/releases/latest";
-const BY_TAG: &str = "https://api.github.com/repos/grapedjuice/ytm-rs/releases/tags/v";
-pub const RELEASES: &str = "https://github.com/grapedjuice/ytm-rs/releases";
+const LATEST: &str = "https://api.github.com/repos/pearleseed/BitChord-PC-Continued/releases/latest";
+const BY_TAG: &str = "https://api.github.com/repos/pearleseed/BitChord-PC-Continued/releases/tags/v";
+pub const RELEASES: &str = concat!(env!("CARGO_PKG_REPOSITORY"), "/releases");
 
 /// Release notes by version: `None` while fetching or when there are none.
 type Notes = Arc<Mutex<std::collections::HashMap<String, Option<String>>>>;
@@ -36,7 +36,7 @@ pub enum State {
     Checking,
     UpToDate,
     Downloading { version: String, percent: u8 },
-    /// `installer` is the setup exe, or for the portable build the new ytm-rs.exe.
+    /// `installer` is the setup exe, or for the portable build the new bitchord.exe.
     Ready { version: String, installer: PathBuf },
     Failed(String),
 }
@@ -68,9 +68,19 @@ pub fn installed() -> bool {
     exe.parent().is_some_and(|d| d.join(marker).exists())
 }
 
-/// The `.app` bundle a binary is in (`X.app/Contents/MacOS/ytm-rs`).
+/// The `.app` bundle a binary is in (`X.app/Contents/MacOS/bitchord`).
 fn bundle_of(exe: &Path) -> Option<&Path> {
     exe.ancestors().nth(3).filter(|a| a.extension().is_some_and(|x| x == "app"))
+}
+
+/// Release tags become filenames and directory names, so accept only the numeric
+/// three-component versions built by the release workflow.
+fn release_version(tag: &str) -> Option<&str> {
+    let version = tag.strip_prefix('v').unwrap_or(tag);
+    let mut parts = version.split('.');
+    let valid_part = |part: &str| part.bytes().all(|c| c.is_ascii_digit()) && part.parse::<u32>().is_ok();
+    (parts.by_ref().take(3).filter(|part| valid_part(part)).count() == 3 && parts.next().is_none())
+        .then_some(version)
 }
 
 /// The release asset this copy updates from.
@@ -79,7 +89,7 @@ fn asset_name(version: &str) -> String {
     let arch = std::env::consts::ARCH;
     if cfg!(target_os = "linux") {
         let kind = if portable { "portable-" } else { "" };
-        return format!("ytm-rs-{kind}{version}-linux-{arch}.tar.gz");
+        return format!("bitchord-{kind}{version}-linux-{arch}.tar.gz");
     }
     // ARM64 Windows builds have their own assets; x64 keeps the original names.
     let (suffix, setup) = if cfg!(target_os = "macos") {
@@ -87,7 +97,7 @@ fn asset_name(version: &str) -> String {
     } else {
         (if cfg!(target_arch = "aarch64") { "-arm64" } else { "" }.to_owned(), "exe")
     };
-    if portable { format!("ytm-rs-portable-{version}{suffix}.zip") } else { format!("ytm-rs-setup-{version}{suffix}.{setup}") }
+    if portable { format!("bitchord-portable-{version}{suffix}.zip") } else { format!("bitchord-setup-{version}{suffix}.{setup}") }
 }
 
 /// The portable build's folder: the download ships a `portable.txt` beside the exe
@@ -205,22 +215,23 @@ impl Updater {
         let http = client()?;
         let feed = std::env::var("YTM_UPDATE_FEED").unwrap_or_else(|_| LATEST.to_owned());
         let release: serde_json::Value = http.get(feed).send().await?.error_for_status()?.json().await?;
-        let tag = release["tag_name"].as_str().unwrap_or_default();
+        let version = release["tag_name"].as_str().and_then(release_version)
+            .ok_or_else(|| anyhow::anyhow!("release feed returned an invalid version"))?;
         if let Some(body) = release["body"].as_str() {
-            self.notes.lock().unwrap().insert(tag.trim_start_matches('v').to_owned(), Some(body.to_owned()));
+            self.notes.lock().unwrap().insert(version.to_owned(), Some(body.to_owned()));
         }
         let current = current_version();
-        if !newer(tag, &current) {
-            log::info!("update: {current} is current (latest {tag})");
+        if !newer(version, &current) {
+            log::info!("update: {current} is current (latest {version})");
             return Ok(State::UpToDate);
         }
-        let version = tag.trim_start_matches('v').to_owned();
+        let version = version.to_owned();
         let portable = portable_dir().is_some();
         let want = asset_name(&version);
         // A release published before its installer was built: nothing to install
         // yet, so this isn't an error. The next check picks it up.
         let Some(asset) = release["assets"].as_array().and_then(|a| a.iter().find(|x| x["name"] == want.as_str())) else {
-            log::info!("update: release {tag} has no {want} yet");
+            log::info!("update: release {version} has no {want} yet");
             return Ok(State::UpToDate);
         };
         let url = asset["browser_download_url"].as_str().ok_or_else(|| anyhow::anyhow!("asset has no URL"))?;
@@ -261,7 +272,7 @@ impl Updater {
                 }
             }
         }
-        let unpacked = self.dir.join(format!("ytm-rs-{version}"));
+        let unpacked = self.dir.join(format!("bitchord-{version}"));
         let ready = if cfg!(target_os = "macos") && !portable {
             open_dmg(&path, &unpacked)?
         } else if portable || cfg!(unix) {
@@ -370,7 +381,7 @@ fn replace_binary(new: &Path, exe: &Path, relaunch: bool) {
 #[cfg(target_os = "macos")]
 fn replace_bundle(new: &Path, app: &Path, relaunch: bool) {
     let parent = app.parent().unwrap_or(Path::new("/"));
-    let (tmp, old) = (parent.join(".ytm-rs.app.new"), parent.join(".ytm-rs.app.old"));
+    let (tmp, old) = (parent.join(".bitchord.app.new"), parent.join(".bitchord.app.old"));
     if std::env::var_os("YTM_UPDATE_DRYRUN").is_some() {
         log::info!("update (dry run): {} in place of {}", new.display(), app.display());
         return;
@@ -408,9 +419,9 @@ fn open_dmg(dmg: &Path, dir: &Path) -> anyhow::Result<PathBuf> {
     std::fs::create_dir_all(&mnt)?;
     let attached = std::process::Command::new("hdiutil").args(["attach", "-nobrowse", "-readonly", "-noautoopen", "-quiet", "-mountpoint"]).arg(&mnt).arg(dmg).status()?;
     anyhow::ensure!(attached.success(), "couldn't open {}", dmg.display());
-    let copied = std::process::Command::new("ditto").arg(mnt.join("ytm-rs.app")).arg(dir.join("ytm-rs.app")).status();
+    let copied = std::process::Command::new("ditto").arg(mnt.join("bitchord.app")).arg(dir.join("bitchord.app")).status();
     let _ = std::process::Command::new("hdiutil").args(["detach", "-quiet"]).arg(&mnt).status();
-    let exe = dir.join("ytm-rs.app/Contents/MacOS/ytm-rs");
+    let exe = dir.join("bitchord.app/Contents/MacOS/bitchord");
     anyhow::ensure!(copied.is_ok_and(|s| s.success()) && exe.exists(), "couldn't copy the app out of {}", dmg.display());
     Ok(exe)
 }
@@ -436,14 +447,16 @@ fn unzip_exe(zip: &Path, dir: &Path) -> anyhow::Result<PathBuf> {
     }
     let status = cmd.status()?;
     #[cfg(windows)]
-    let exe = dir.join("ytm-rs.exe");
-    // Everything is in one top-level folder: the binary, or on macOS the app bundle.
-    #[cfg(not(windows))]
+    let exe = dir.join("bitchord.exe");
+    // The portable macOS ZIP contains the app bundle at its root.
+    #[cfg(target_os = "macos")]
+    let exe = dir.join("bitchord.app/Contents/MacOS/bitchord");
+    #[cfg(all(unix, not(target_os = "macos")))]
     let exe = std::fs::read_dir(dir)?
         .flatten()
-        .flat_map(|e| [e.path().join("ytm-rs"), e.path().join("ytm-rs.app/Contents/MacOS/ytm-rs")])
+        .map(|e| e.path().join("bitchord"))
         .find(|p| p.is_file())
-        .unwrap_or_else(|| dir.join("ytm-rs"));
+        .unwrap_or_else(|| dir.join("bitchord"));
     anyhow::ensure!(status.success() && exe.exists(), "couldn't unpack {}", zip.display());
     Ok(exe)
 }
@@ -475,7 +488,34 @@ fn client() -> anyhow::Result<reqwest::Client> {
 
 #[cfg(test)]
 mod tests {
-    use super::newer;
+    use super::{newer, release_version};
+
+    #[test]
+    fn release_tags_are_safe_path_components() {
+        assert_eq!(release_version("v2.3.4"), Some("2.3.4"));
+        for invalid in ["", "v2.0", "2.0.0.0", "2.0.0-beta", "2.0.0/../../other", "v2.0.+1"] {
+            assert_eq!(release_version(invalid), None);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn portable_archive_accepts_a_top_level_app_bundle() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let executable = "bitchord.app/Contents/MacOS/bitchord";
+        std::fs::create_dir_all(source.join(executable).parent().unwrap()).unwrap();
+        std::fs::write(source.join(executable), b"test binary").unwrap();
+        let archive = temp.path().join("update.tar");
+        let status = std::process::Command::new("tar")
+            .arg("-cf").arg(&archive).arg("-C").arg(&source).arg("bitchord.app")
+            .status().unwrap();
+        assert!(status.success());
+        let unpacked = temp.path().join("unpacked");
+        let found = super::unzip_exe(&archive, &unpacked).unwrap();
+        assert_eq!(found, unpacked.join(executable));
+        assert_eq!(std::fs::read(found).unwrap(), b"test binary");
+    }
 
     #[test]
     fn version_order() {

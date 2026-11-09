@@ -73,17 +73,23 @@ If Windows SmartScreen appears for an unsigned build, choose **More info → Run
 
 ## Building from source
 
-You need [Rust](https://rustup.rs/) 1.95 or newer.
+You need [Rust](https://rustup.rs/) 1.95 or newer. On macOS, install the Xcode command-line tools for the AppKit bridge and bundle tooling.
 
 ```sh
 git clone https://github.com/pearleseed/BitChord-PC-Continued.git
 cd BitChord-PC-Continued
+cargo test --locked
 cargo build --release --locked
 ```
 
-The built app will be in `target/release/`.
+The executable is `target/release/bitchord` (`bitchord.exe` on Windows). To build a macOS app bundle, pass the current Cargo package version:
 
-Platform builds may require native dependencies (audio/system libraries and toolchain components used by sign-in or platform integrations). Check the repository’s platform docs and release workflow for the exact prerequisites.
+```sh
+macos/bundle.sh target/release/bitchord 2.0.0 dist
+open dist/bitchord.app
+```
+
+See the [development guide](docs/development.md) for the architecture, platform dependencies, signing, service configuration, and the modernization audit.
 
 ## Notes
 

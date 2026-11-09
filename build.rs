@@ -11,6 +11,7 @@ fn main() {
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
         println!("cargo:rerun-if-changed=macos/window_chrome.m");
         println!("cargo:rustc-link-lib=framework=AppKit");
+        println!("cargo:rustc-link-lib=framework=CoreText");
         cc::Build::new()
             .file("macos/window_chrome.m")
             .flag("-fobjc-arc")

@@ -405,11 +405,6 @@ const LUCIDE: &[u8] = include_bytes!("../assets/fonts/lucide.ttf");
 /// Instrument Sans is only ever used at semibold (one preset), so its bold slot reuses
 /// that instead of shipping a weight nothing draws.
 const LYRIC_FONTS: &[(&str, [&[u8]; 3])] = &[
-    ("sfpro", [
-        include_bytes!("../assets/fonts/SFProDisplay-Regular.otf"),
-        include_bytes!("../assets/fonts/SFProDisplay-SemiBold.otf"),
-        include_bytes!("../assets/fonts/SFProDisplay-Bold.otf"),
-    ]),
     ("dmsans", [
         include_bytes!("../assets/fonts/DMSans-Regular.ttf"),
         include_bytes!("../assets/fonts/DMSans-SemiBold.ttf"),
@@ -479,6 +474,28 @@ impl Face {
     }
 }
 
+/// Preserve the preset and preference key. On macOS, borrow the system font
+/// from its installed file instead of redistributing Apple's download.
+fn sf_pro_faces() -> Option<[Face; 3]> {
+    #[cfg(target_os = "macos")]
+    {
+        use skrifa::MetadataProvider;
+        static FACES: std::sync::OnceLock<Option<[Face; 3]>> = std::sync::OnceLock::new();
+        *FACES.get_or_init(|| {
+            let bytes = map(crate::macos_chrome::system_font_path()?)?;
+            let font = skrifa::FontRef::from_index(bytes, 0).ok()?;
+            let axis = font.axes().iter().find(|a| a.tag() == skrifa::Tag::new(b"wght"))?;
+            Some([400.0_f32, 600.0, 700.0].map(|w| Face {
+                bytes,
+                index: 0,
+                wght: Some(w.clamp(axis.min_value(), axis.max_value())),
+            }))
+        })
+    }
+    #[cfg(not(target_os = "macos"))]
+    None
+}
+
 pub fn set_font_choice(name: &str) {
     *FONT_CHOICE.write().unwrap() = name.to_owned();
 }
@@ -498,7 +515,7 @@ pub fn effective_font(theme_font: &str) -> String {
 fn font_key(name: &str) -> &'static str {
     let name = effective_font(name);
     if let Some(k) = lyric_key(&name) {
-        return k;
+        return if k == "sfpro" && sf_pro_faces().is_none() { "inter" } else { k };
     }
     if CHOICE.read().unwrap().as_ref().is_some_and(|c| c.name.eq_ignore_ascii_case(&name)) { "choice" } else { "inter" }
 }
@@ -530,6 +547,7 @@ pub fn lyric_font_for(name: &str, weight: crate::preset::Weight, size: f32, text
 fn lacks_letters(key: &str, text: &str) -> bool {
     use skrifa::MetadataProvider;
     let face = match key {
+        "sfpro" => match sf_pro_faces() { Some(faces) => faces[0], None => return false },
         "choice" => match CHOICE.read().unwrap().as_ref() {
             Some(c) => c.faces[0],
             None => return false,
@@ -593,7 +611,11 @@ fn font_dirs() -> Vec<std::path::PathBuf> {
     #[cfg(all(unix, not(target_os = "macos")))]
     dirs.extend(["/usr/share/fonts", "/usr/local/share/fonts"].map(Into::into));
     if let Some(home) = std::env::var_os("HOME") {
-        dirs.push(std::path::PathBuf::from(home).join(".local/share/fonts"));
+        let home = std::path::PathBuf::from(home);
+        #[cfg(target_os = "macos")]
+        dirs.push(home.join("Library/Fonts"));
+        #[cfg(not(target_os = "macos"))]
+        dirs.push(home.join(".local/share/fonts"));
     }
     dirs
 }
@@ -804,6 +826,7 @@ pub fn install_fonts(ctx: &egui::Context, ui_font: &str) {
     let choice = CHOICE.read().unwrap().as_ref().map(|c| c.faces);
     let mut groups: Vec<(&str, [Face; 3])> = vec![("inter", INTER.map(Face::of))];
     groups.extend(LYRIC_FONTS.iter().map(|(k, w)| (*k, w.map(Face::of))));
+    groups.extend(sf_pro_faces().map(|faces| ("sfpro", faces)));
     groups.extend(choice.map(|faces| ("choice", faces)));
     for (key, faces) in &groups {
         let (asc_p, h_p) = em_metrics(faces[0].bytes, faces[0].index).unwrap_or((0.97, 1.21));

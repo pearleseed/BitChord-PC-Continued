@@ -479,7 +479,7 @@ void main(){
   }));
 
   /* ---------------- live GitHub data ---------------- */
-  const REPO = "grapedjuice/ytm-rs";
+  const REPO = "pearleseed/BitChord-PC-Continued";
   const cached = (key, url) => {
     try {
       const hit = JSON.parse(sessionStorage.getItem(key) || "null");
@@ -511,7 +511,7 @@ void main(){
     $$("[data-os-label]").forEach((el) => (el.textContent = `Download for ${name}`));
     $$(`[data-os="${os}"]`).forEach((el) => el.classList.add("is-yours"));
   }
-  cached("ytmrs-release", `https://api.github.com/repos/${REPO}/releases/latest`).then((rel) => {
+  cached("bitchord-release", `https://api.github.com/repos/${REPO}/releases/latest`).then((rel) => {
     if (!rel || !rel.tag_name) return;
     $$("[data-version]").forEach((el) => (el.textContent = rel.tag_name));
     const assets = rel.assets || [];

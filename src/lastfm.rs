@@ -14,8 +14,20 @@ use md5::{Digest, Md5};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-const API_KEY: &str = "f66d99b311f6d58e14be93a8a6cd8893";
-const SECRET: &str = "403541d654c21a4fcd515c9b3eb474d9";
+/// Build-provided credentials for releases, with an environment override for local use.
+fn credentials() -> Option<&'static (String, String)> {
+    static CONFIG: std::sync::OnceLock<Option<(String, String)>> = std::sync::OnceLock::new();
+    CONFIG.get_or_init(|| {
+        let key = std::env::var("LASTFM_API_KEY").ok().or_else(|| option_env!("LASTFM_API_KEY").map(str::to_owned))?;
+        let secret = std::env::var("LASTFM_SECRET").ok().or_else(|| option_env!("LASTFM_SECRET").map(str::to_owned))?;
+        (!key.is_empty() && !secret.is_empty()).then_some((key, secret))
+    }).as_ref()
+}
+
+pub fn configured() -> bool {
+    credentials().is_some()
+}
+
 const ROOT: &str = "https://ws.audioscrobbler.com/2.0/";
 const VAULT: &str = "lastfm";
 /// Last.fm takes up to 50 scrobbles per request.
@@ -43,9 +55,16 @@ struct State {
     session: Option<Session>,
     data_dir: PathBuf,
     queue: Vec<Scrobble>,
+    epoch: u64,
 }
 
-static STATE: LazyLock<Mutex<State>> = LazyLock::new(|| Mutex::new(State { session: None, data_dir: PathBuf::new(), queue: Vec::new() }));
+impl State {
+    fn session_for(&self, epoch: u64) -> Option<&Session> {
+        self.session.as_ref().filter(|_| self.epoch == epoch)
+    }
+}
+
+static STATE: LazyLock<Mutex<State>> = LazyLock::new(|| Mutex::new(State { session: None, data_dir: PathBuf::new(), queue: Vec::new(), epoch: 0 }));
 /// One send at a time, so a queued scrobble never goes out twice.
 static SENDING: LazyLock<tokio::sync::Mutex<()>> = LazyLock::new(Default::default);
 
@@ -57,7 +76,7 @@ pub fn init(data_dir: &Path) {
         Some(Session { name: name.to_owned(), key: key.to_owned() })
     });
     let queue = std::fs::read(data_dir.join("lastfm_queue.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
-    *STATE.lock().unwrap() = State { session, data_dir: data_dir.to_owned(), queue };
+    *STATE.lock().unwrap() = State { session, data_dir: data_dir.to_owned(), queue, epoch: 0 };
 }
 
 /// The signed-in Last.fm user.
@@ -66,19 +85,24 @@ pub fn user() -> Option<String> {
 }
 
 pub fn sign_out() {
-    let mut st = STATE.lock().unwrap();
+    clear_session(&mut STATE.lock().unwrap());
+}
+
+fn clear_session(st: &mut State) {
+    st.epoch += 1;
     st.session = None;
     st.queue.clear();
-    save_queue(&st);
+    save_queue(st);
     crate::vault::delete(VAULT, &st.data_dir);
 }
 
 /// Ask the user to allow ytm-rs on last.fm (in their browser) and wait until they do.
 /// Returns the account name.
 pub async fn sign_in(http: &reqwest::Client) -> anyhow::Result<String> {
+    let (api_key, _) = credentials().ok_or_else(|| anyhow::anyhow!("this build has no Last.fm credentials"))?;
     let token = call(http, "auth.getToken", &[], None, false).await?;
     let token = token["token"].as_str().ok_or_else(|| anyhow::anyhow!("no token from Last.fm"))?.to_owned();
-    open_browser(&format!("https://www.last.fm/api/auth/?api_key={API_KEY}&token={token}"));
+    open_browser(&format!("https://www.last.fm/api/auth/?api_key={api_key}&token={token}"));
     let t0 = std::time::Instant::now();
     loop {
         tokio::time::sleep(Duration::from_secs(3)).await;
@@ -86,9 +110,10 @@ pub async fn sign_in(http: &reqwest::Client) -> anyhow::Result<String> {
             Ok(v) => {
                 let name = v["session"]["name"].as_str().unwrap_or_default().to_owned();
                 let key = v["session"]["key"].as_str().ok_or_else(|| anyhow::anyhow!("no session key from Last.fm"))?.to_owned();
-                let data_dir = STATE.lock().unwrap().data_dir.clone();
-                crate::vault::set(VAULT, &data_dir, format!("{name}\n{key}").as_bytes())?;
-                STATE.lock().unwrap().session = Some(Session { name: name.clone(), key });
+                let mut st = STATE.lock().unwrap();
+                crate::vault::set(VAULT, &st.data_dir, format!("{name}\n{key}").as_bytes())?;
+                st.epoch += 1;
+                st.session = Some(Session { name: name.clone(), key });
                 log::info!("last.fm: signed in as {name}");
                 return Ok(name);
             }
@@ -100,8 +125,14 @@ pub async fn sign_in(http: &reqwest::Client) -> anyhow::Result<String> {
     }
 }
 
-pub async fn now_playing(http: &reqwest::Client, s: &Scrobble) {
-    let Some(sk) = session_key() else { return };
+pub fn session_epoch() -> Option<u64> {
+    let st = STATE.lock().unwrap();
+    st.session.as_ref().map(|_| st.epoch)
+}
+
+pub async fn now_playing(http: &reqwest::Client, epoch: u64, s: &Scrobble) {
+    let sk = STATE.lock().unwrap().session_for(epoch).map(|s| s.key.clone());
+    let Some(sk) = sk else { return };
     let duration = s.duration.map(|d| d.to_string());
     let mut params = vec![("artist", s.artist.as_str()), ("track", s.track.as_str())];
     if let Some(album) = &s.album {
@@ -117,12 +148,24 @@ pub async fn now_playing(http: &reqwest::Client, s: &Scrobble) {
 }
 
 /// Scrobble `s`, along with any earlier ones still waiting.
-pub async fn scrobble(http: &reqwest::Client, s: Scrobble) {
+pub async fn scrobble(http: &reqwest::Client, epoch: u64, s: Scrobble) {
+    let sk = {
+        let mut st = STATE.lock().unwrap();
+        let Some(session) = st.session_for(epoch) else { return };
+        let sk = session.key.clone();
+        st.queue.push(s);
+        save_queue(&st);
+        sk
+    };
     let _sending = SENDING.lock().await;
-    let Some(sk) = session_key() else { return };
-    STATE.lock().unwrap().queue.push(s);
     loop {
-        let batch: Vec<Scrobble> = STATE.lock().unwrap().queue.iter().take(BATCH).cloned().collect();
+        let batch: Vec<Scrobble> = {
+            let st = STATE.lock().unwrap();
+            if st.epoch != epoch {
+                return;
+            }
+            st.queue.iter().take(BATCH).cloned().collect()
+        };
         if batch.is_empty() {
             break;
         }
@@ -141,40 +184,53 @@ pub async fn scrobble(http: &reqwest::Client, s: Scrobble) {
             })
             .collect();
         let params: Vec<(&str, &str)> = fields.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-        match call(http, "track.scrobble", &params, Some(&sk), true).await {
-            Ok(v) => {
-                let accepted = v["scrobbles"]["@attr"]["accepted"].as_u64().unwrap_or(0);
+        let response = call(http, "track.scrobble", &params, Some(&sk), true).await.and_then(|value| {
+            let accepted = &value["scrobbles"]["@attr"]["accepted"];
+            accepted.as_u64().or_else(|| accepted.as_str().and_then(|n| n.parse().ok()))
+                .ok_or_else(|| anyhow::anyhow!("Last.fm returned no scrobble receipt"))
+        });
+        let mut st = STATE.lock().unwrap();
+        if st.epoch != epoch {
+            return;
+        }
+        match response {
+            Ok(accepted) => {
                 log::info!("last.fm: scrobbled {accepted} of {}", batch.len());
-                let mut st = STATE.lock().unwrap();
                 st.queue.drain(..batch.len());
                 save_queue(&st);
             }
             // 9: the session was revoked on last.fm.
             Err(e) if code(&e) == Some(9) => {
                 log::warn!("last.fm: session no longer valid; signing out");
-                sign_out();
+                clear_session(&mut st);
                 break;
             }
             // Offline or Last.fm trouble (11, 16, 29): keep them for next time.
             Err(e) => {
                 log::warn!("last.fm: scrobble failed, keeping {} for later: {e:#}", batch.len());
-                save_queue(&STATE.lock().unwrap());
                 break;
             }
         }
     }
 }
 
-fn session_key() -> Option<String> {
-    STATE.lock().unwrap().session.as_ref().map(|s| s.key.clone())
-}
-
 fn save_queue(st: &State) {
     let path = st.data_dir.join("lastfm_queue.json");
-    if st.queue.is_empty() {
-        let _ = std::fs::remove_file(path);
-    } else if let Ok(json) = serde_json::to_vec(&st.queue) {
-        let _ = std::fs::write(path, json);
+    let result = if st.queue.is_empty() {
+        match std::fs::remove_file(&path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            result => result.map_err(anyhow::Error::from),
+        }
+    } else {
+        (|| -> anyhow::Result<()> {
+            let mut file = tempfile::NamedTempFile::new_in(&st.data_dir)?;
+            serde_json::to_writer(&mut file, &st.queue)?;
+            file.persist(&path)?;
+            Ok(())
+        })()
+    };
+    if let Err(error) = result {
+        log::warn!("could not save Last.fm queue: {error:#}");
     }
 }
 
@@ -195,7 +251,7 @@ impl std::fmt::Display for ApiError {
 impl std::error::Error for ApiError {}
 
 /// md5 of every parameter as name+value, sorted by name, then the secret.
-fn signature(params: &[(&str, &str)]) -> String {
+fn signature(params: &[(&str, &str)], secret: &str) -> String {
     let mut sorted = params.to_vec();
     sorted.sort_by(|a, b| a.0.cmp(b.0));
     let mut h = Md5::new();
@@ -203,24 +259,28 @@ fn signature(params: &[(&str, &str)]) -> String {
         h.update(k.as_bytes());
         h.update(v.as_bytes());
     }
-    h.update(SECRET.as_bytes());
+    h.update(secret.as_bytes());
     h.finalize().iter().map(|b| format!("{b:02x}")).collect()
 }
 
 async fn call(http: &reqwest::Client, method: &str, params: &[(&str, &str)], sk: Option<&str>, post: bool) -> anyhow::Result<Value> {
-    let mut all = vec![("method", method), ("api_key", API_KEY)];
+    let (key, secret) = credentials().ok_or_else(|| anyhow::anyhow!("this build has no Last.fm credentials"))?;
+    let mut all = vec![("method", method), ("api_key", key.as_str())];
     all.extend_from_slice(params);
     if let Some(sk) = sk {
         all.push(("sk", sk));
     }
-    let sig = signature(&all);
+    let sig = signature(&all, secret);
     all.push(("api_sig", &sig));
     all.push(("format", "json"));
     let req = if post { http.post(ROOT).form(&all) } else { http.get(ROOT).query(&all) };
-    let v: Value = req.timeout(Duration::from_secs(20)).send().await?.json().await?;
+    let response = req.timeout(Duration::from_secs(20)).send().await?;
+    let status = response.status();
+    let v: Value = response.json().await?;
     if let Some(code) = v["error"].as_u64() {
         return Err(ApiError(code, v["message"].as_str().unwrap_or_default().to_owned()).into());
     }
+    anyhow::ensure!(status.is_success(), "Last.fm returned HTTP {status}");
     Ok(v)
 }
 
@@ -243,10 +303,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn pending_work_cannot_use_a_replacement_session() {
+        let st = State {
+            session: Some(Session { name: "listener".into(), key: "new-key".into() }),
+            data_dir: PathBuf::new(),
+            queue: Vec::new(),
+            epoch: 2,
+        };
+        assert!(st.session_for(1).is_none());
+        assert_eq!(st.session_for(2).unwrap().key, "new-key");
+    }
+
+    #[test]
     fn signature_sorts_params_and_appends_the_secret() {
-        let sig = signature(&[("method", "auth.getToken"), ("api_key", API_KEY)]);
+        let sig = signature(&[("method", "auth.getToken"), ("api_key", "test-key")], "test-secret");
         let mut h = Md5::new();
-        h.update(format!("api_key{API_KEY}methodauth.getToken{SECRET}"));
+        h.update("api_keytest-keymethodauth.getTokentest-secret");
         let want: String = h.finalize().iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(sig, want);
     }
