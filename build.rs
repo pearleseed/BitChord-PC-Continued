@@ -8,6 +8,14 @@ fn main() {
             .compile()
             .expect("failed to embed Windows icon");
     }
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
+        println!("cargo:rerun-if-changed=macos/window_chrome.m");
+        println!("cargo:rustc-link-lib=framework=AppKit");
+        cc::Build::new()
+            .file("macos/window_chrome.m")
+            .flag("-fobjc-arc")
+            .compile("bitchord_window_chrome");
+    }
 }
 
 // The segment heap returns freed memory to the OS far more readily than the default

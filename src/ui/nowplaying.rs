@@ -54,7 +54,7 @@ pub fn overlay(app: &mut App, ctx: &egui::Context, now: f64) {
                 }
             } else if let Some(bg) = app.bg.as_ref().filter(|_| art) {
                 let blend = theme::ease_in_out(((now - app.art_changed) / 1.4) as f32);
-                let level = if app.reactive_bg && app.playing() { app.audio.status.level() * b.reactive } else { 0.0 };
+                let level = if app.reactive_bg && app.playing() && !theme::reduce_motion() { app.audio.status.level() * b.reactive } else { 0.0 };
                 bg.paint(
                     &painter,
                     rect,
@@ -98,7 +98,7 @@ fn body(app: &mut App, ui: &mut Ui, now: f64) {
     // 860 points, and below that the cover gives way to the panel.
     let narrow = area.width() - 64.0 < 860.0;
     // Header: on the window buttons' line, when the app draws them.
-    let lift = 20.0 - f32::from(super::titlebar::top_margin(20, 44.0));
+    let lift = 20.0 - f32::from(super::titlebar::top_margin(ui.ctx(), 20, 44.0));
     let header = Rect::from_min_size(area.min - vec2(0.0, if app.fullscreen { 0.0 } else { lift }), vec2(area.width(), 44.0));
     let mut hui = ui.new_child(egui::UiBuilder::new().max_rect(header).layout(egui::Layout::left_to_right(egui::Align::Center)));
     // The player's own close, top left; the window buttons keep the top right.
@@ -132,7 +132,7 @@ fn body(app: &mut App, ui: &mut Ui, now: f64) {
         app.np_tab
     };
     // Linear 0..1 over the transition; each part eases its own slice of it.
-    let shown = ui.ctx().animate_bool_with_time(egui::Id::unique("np-panel"), app.np_tab != NpTab::Art, 0.6 * theme::SPEED);
+    let shown = ui.ctx().animate_bool_with_time(egui::Id::unique("np-panel"), app.np_tab != NpTab::Art, theme::motion_time(0.6));
     if shown > 0.0 && shown < 1.0 {
         // Every frame while sliding, not the now-playing view's usual 30 fps.
         ui.ctx().request_repaint();
@@ -193,7 +193,7 @@ fn body(app: &mut App, ui: &mut Ui, now: f64) {
         // Switching between Lyrics and Up next: the old one fades out over the first 55%,
         // the new one fades in and rises into place from a third of the way.
         for (tab, key) in [(NpTab::Lyrics, "np-tab-lyrics"), (NpTab::UpNext, "np-tab-upnext")] {
-            let w = ui.ctx().animate_bool_with_time(egui::Id::unique(key), panel_tab == tab, 0.45 * theme::SPEED);
+            let w = ui.ctx().animate_bool_with_time(egui::Id::unique(key), panel_tab == tab, theme::motion_time(0.45));
             if w > 0.0 && w < 1.0 {
                 ui.ctx().request_repaint();
             }

@@ -1,4 +1,4 @@
-//! Page bodies. Every page fades and slides in when navigated to.
+//! Page bodies and navigation transitions.
 
 use std::collections::HashSet;
 use std::sync::atomic::Ordering;
@@ -41,12 +41,15 @@ fn feed_tile(ui: &Ui, square: bool) -> f32 {
 }
 
 pub fn page(app: &mut App, ui: &mut Ui, now: f64) {
-    let t = theme::ease_out(((now - app.page_changed) / 0.32) as f32);
+    let mac = cfg!(target_os = "macos");
+    let duration = if mac { 0.18 } else { 0.32 };
+    let t = if theme::reduce_motion() { 1.0 } else { theme::ease_out(((now - app.page_changed) / duration) as f32) };
     if t < 1.0 {
         // The fade-in finishes even when nothing else is drawing frames.
         ui.ctx().request_repaint();
     }
-    ui.set_opacity(0.15 + 0.85 * t);
+    let initial_opacity = if mac { 0.72 } else { 0.15 };
+    ui.set_opacity(initial_opacity + (1.0 - initial_opacity) * t);
     let page = app.page.clone();
     // Each page (each album, each search) keeps its own scroll position.
     let mut area = egui::ScrollArea::vertical().id_salt(("page", &page)).auto_shrink(false);
@@ -58,7 +61,9 @@ pub fn page(app: &mut App, ui: &mut Ui, now: f64) {
     }
     let out = area.show(ui, |ui| {
         ui.set_max_width((ui.available_width() - 20.0).max(0.0));
-        ui.add_space(18.0 * (1.0 - t));
+        if !mac {
+            ui.add_space(18.0 * (1.0 - t));
+        }
         match &page {
             Page::Home => home(app, ui, now),
             Page::New => new(app, ui, now),
@@ -421,9 +426,10 @@ fn new(app: &mut App, ui: &mut Ui, now: f64) {
 
 pub(super) fn page_title(ui: &mut Ui, title: &str) {
     // Left-aligned with the page's content, a little below the top edge.
-    ui.add_space(18.0);
+    let mac = cfg!(target_os = "macos");
+    ui.add_space(if mac { 4.0 } else { 18.0 });
     let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 42.0), Sense::hover());
-    ui.painter().text(pos2(rect.left(), rect.center().y), Align2::LEFT_CENTER, title, theme::bold(34.0), theme::text());
+    ui.painter().text(pos2(rect.left(), rect.center().y), Align2::LEFT_CENTER, title, theme::bold(if mac { 31.0 } else { 34.0 }), theme::text());
 }
 
 // ------------------------------------------------------------------ search
@@ -1165,7 +1171,7 @@ fn settings_account(app: &mut App, ui: &mut Ui) {
     settings_card(ui, |ui| {
         if app.logged_in {
             let name = app.account_name.clone().unwrap_or_else(|| "YouTube Music".to_owned());
-            setting_row(ui, &name, Some("Signed in with Google. Your home feed, library and likes come from this account. Saved encrypted in Windows Credential Manager."), |ui| {
+            setting_row(ui, &name, Some("Signed in with Google. Your home feed, library and likes come from this account."), |ui| {
                 sign_out = pill(ui, "Sign out", Some(icon::LOG_OUT), false).clicked();
             });
             // Also with one, when the one in use isn't it (a brand channel since deleted).
@@ -1263,7 +1269,7 @@ fn settings_playback(app: &mut App, ui: &mut Ui) {
             toggle(ui, &mut app.play_songs, "Play songs, not music videos");
         });
         divider(ui);
-        setting_row(ui, "Output device", Some("Where the music plays. A picked device that isn't connected leaves it to Windows' default until it's back."), |ui| {
+        setting_row(ui, "Output device", Some("If your chosen device disconnects, playback uses the system default until it reconnects."), |ui| {
             output_device_picker(app, ui);
         });
         divider(ui);
@@ -1551,7 +1557,7 @@ fn settings_appearance(app: &mut App, ui: &mut Ui) {
             toggle(ui, &mut app.reactive_bg, "Pulse with the music");
         });
         divider(ui);
-        setting_row(ui, "Font", Some("For the whole app and the lyrics. Any font installed on this PC works, e.g. one made for your language."), |ui| {
+        setting_row(ui, "Font", Some("Choose an installed font for the app and lyrics."), |ui| {
             if let Some(name) = font_picker(ui) {
                 theme::set_font_choice(&name);
                 app.chrome_applied = None;
@@ -1734,7 +1740,7 @@ fn network(app: &mut App, ui: &mut Ui) {
             ui.horizontal(|ui| {
                 save = pill(ui, if saved { "Saved" } else { "Save" }, None, !saved).clicked() && !saved;
                 ui.add_space(8.0);
-                ui.label(RichText::new("A password in the address is kept in Windows Credential Manager.").font(theme::regular(12.5)).color(theme::text_dim()));
+                ui.label(RichText::new("Proxy credentials are stored in your system’s credential store.").font(theme::regular(12.5)).color(theme::text_dim()));
             });
             if save {
                 match proxy::save(app.backend.data_dir(), &custom) {
@@ -1845,7 +1851,7 @@ fn font_picker(ui: &mut Ui) -> Option<String> {
     picked.filter(|p| *p != current)
 }
 
-const SYSTEM_DEFAULT: &str = "Windows default";
+const SYSTEM_DEFAULT: &str = "System default";
 
 fn output_device_picker(app: &mut App, ui: &mut Ui) {
     let current = match &app.output_device {
@@ -1954,7 +1960,8 @@ pub(super) fn settings_card(ui: &mut Ui, body: impl FnOnce(&mut Ui)) {
 /// A settings row: title and description on the left, the control on the right.
 pub(super) fn setting_row(ui: &mut Ui, title: &str, desc: Option<&str>, control: impl FnOnce(&mut Ui)) {
     let w = ui.available_width();
-    let text_w = (w - 230.0).max(200.0);
+    let min_text = if cfg!(target_os = "macos") { 116.0 } else { 200.0 };
+    let text_w = (w - 230.0).max(min_text);
     let title_g = widgets::galley(ui, title, theme::semibold(14.5), theme::text(), text_w);
     let desc_g = desc.map(|d| widgets::galley_wrapped(ui, d, theme::regular(12.5), theme::text_dim(), text_w, 3));
     let text_h = title_g.size().y + desc_g.as_ref().map_or(0.0, |g| g.size().y + 3.0);

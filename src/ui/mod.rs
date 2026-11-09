@@ -261,6 +261,8 @@ impl Drop for MotionView {
 }
 
 pub struct App {
+    #[cfg(target_os = "macos")]
+    macos_chrome: Option<crate::macos_chrome::Chrome>,
     backend: Backend,
     audio: AudioHandle,
     ch: Channels,
@@ -601,6 +603,8 @@ impl App {
             crate::transfer::Transfer::new(backend.data_dir(), Arc::new(move || b.wake()))
         };
         let mut app = Self {
+            #[cfg(target_os = "macos")]
+            macos_chrome: None,
             backend,
             audio,
             ch,
@@ -846,6 +850,12 @@ impl App {
     }
 
     // ---------------------------------------------------------------- navigation
+
+    #[cfg(target_os = "macos")]
+    pub fn with_macos_chrome(mut self, chrome: Option<crate::macos_chrome::Chrome>) -> Self {
+        self.macos_chrome = chrome;
+        self
+    }
 
     fn go(&mut self, page: Page) {
         self.np_open = false;
@@ -1105,6 +1115,15 @@ impl App {
 
 impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        #[cfg(target_os = "macos")]
+        if let Some(chrome) = &self.macos_chrome {
+            if crate::macos_chrome::refresh_preferences() {
+                theme::refresh_accessibility(ctx);
+            }
+            let (back, forward) = chrome.take_history();
+            if back { self.nav_back(); }
+            if forward { self.nav_forward(); }
+        }
         dev_pace();
         self.lyric_view.release_hidden(ctx.cumulative_pass_nr());
         let now = ctx.input(|i| i.time);
@@ -1208,7 +1227,7 @@ impl eframe::App for App {
         } else if playing && widgets::equalizer_shown(ctx) {
             // The playing row's bars need a steady, full rate to read as smooth.
             ctx.request_repaint_after(Duration::from_millis(16));
-        } else if playing && self.anim_bg && shell::pages_bg_moves(self.look()) {
+        } else if playing && self.anim_bg && !theme::reduce_motion() && shell::pages_bg_moves(self.look()) {
             ctx.request_repaint_after(Duration::from_millis(66));
         } else if playing || self.buffering() {
             ctx.request_repaint_after(Duration::from_millis(250));
@@ -1227,6 +1246,13 @@ impl eframe::App for App {
         let np = theme::anim_bool(&ctx, "np-open", self.np_open && self.current().is_some(), 0.42);
         let light = self.light_pages(&ctx) && np < 0.5 && !self.fullscreen;
         theme::set_mode(&ctx, light);
+        #[cfg(target_os = "macos")]
+        if let Some(chrome) = &mut self.macos_chrome {
+            let follows_system = self.appearance == theme::Appearance::System
+                && look.id == crate::preset::DEFAULT_ID && np < 0.5 && !self.fullscreen;
+            chrome.set_appearance((!follows_system).then_some(light));
+            titlebar::set_content_top(&ctx, chrome.top_inset(&ctx));
+        }
         if self.chrome_applied.as_deref() != Some(look.id.as_str()) {
             if self.chrome_applied.is_none() {
                 ctx.add_texture_loader(Arc::new(crate::images::Textures::default()));
@@ -1248,6 +1274,10 @@ impl eframe::App for App {
         // full window keeps its corners.
         crate::fullscreen::set_rounded((layout == mini::Layout::Mini).then(|| (theme::thumb_radius() + 1.0) * ctx.pixels_per_point()));
         if layout != mini::Layout::Full {
+            #[cfg(target_os = "macos")]
+            if let Some(chrome) = &self.macos_chrome {
+                chrome.layout_history(&ctx, None, false, false);
+            }
             shell::background(self, ui, screen, now, None);
             if layout == mini::Layout::Mini {
                 mini::strip(self, ui, now);
@@ -1272,12 +1302,14 @@ impl eframe::App for App {
                 .show_separator_line(false)
                 .show(ui, |ui| shell::player_bar(self, ui, now, false));
         }
-        if !self.fullscreen && !covered {
+        let history_rect = if !self.fullscreen && !covered {
             use crate::preset::SidebarStyle;
             let side_alpha = app_style.sidebar_alpha.clamp(0.0, 1.0);
-            // The logo's row is 32 points tall.
-            let side_margin = egui::Margin { left: 14, right: 14, top: titlebar::top_margin(16, 32.0), bottom: 16 };
+            let inset = if cfg!(target_os = "macos") { 12 } else { 14 };
+            let side_margin = egui::Margin { left: inset, right: inset, top: titlebar::top_margin(&ctx, 16, 32.0), bottom: 16 };
+            let floating_margin = egui::Margin { left: 12, right: 12, top: (titlebar::content_top(&ctx) - 4.0).max(14.0) as i8, bottom: 14 };
             let side_frame = match app_style.sidebar {
+                SidebarStyle::Glass if theme::macos_default() => egui::Frame::new().fill(theme::sidebar_fill()).inner_margin(side_margin),
                 SidebarStyle::Glass => egui::Frame::new().fill(theme::panel(side_alpha)).inner_margin(side_margin),
                 SidebarStyle::Transparent => egui::Frame::new().inner_margin(side_margin),
                 SidebarStyle::Solid => egui::Frame::new().fill(look.solid()).inner_margin(side_margin),
@@ -1286,27 +1318,34 @@ impl eframe::App for App {
                     .stroke(egui::Stroke::new(1.0, theme::glass(0.08)))
                     .corner_radius(egui::CornerRadius::same(theme::panel_radius().max(12)))
                     .outer_margin(egui::Margin { left: 10, right: 4, top: 10, bottom: 10 })
-                    .inner_margin(egui::Margin::symmetric(12, 14)),
+                    .inner_margin(floating_margin),
             };
             // The sidebar first, so it runs the window's full height: the player floats
             // over the main section only, and the page content scrolls under it.
-            egui::Panel::left("nav").resizable(false)
+            let history_rect = egui::Panel::left("nav").resizable(false)
                 .exact_size(shell::SIDEBAR_W - (shell::SIDEBAR_W - shell::RAIL_W) * shell::sidebar_collapse(self, &ctx))
                 .frame(side_frame)
                 .show_separator_line(false)
-                .show(ui, |ui| shell::sidebar(self, ui));
+                .show(ui, |ui| shell::sidebar(self, ui)).inner;
             let section = ui.available_rect_before_wrap();
             let q = theme::anim_bool(&ctx, "queue-drawer", self.queue_open && !self.np_open, 0.25);
-            if q > 0.01 {
+            let overlay_queue = cfg!(target_os = "macos") && section.width() < 760.0;
+            let queue_margin = egui::Margin {
+                left: 14,
+                right: 14,
+                top: if cfg!(target_os = "macos") { titlebar::top_margin(&ctx, 16, 32.0) } else { 16 },
+                bottom: 16,
+            };
+            if q > 0.01 && !overlay_queue {
                 egui::Panel::right("queue").resizable(false)
                     .exact_size(340.0 * q)
-                    .frame(egui::Frame::new().fill(theme::panel(0.42)).inner_margin(egui::Margin::symmetric(14, 16)))
+                    .frame(egui::Frame::new().fill(theme::panel(0.42)).inner_margin(queue_margin))
                     .show_separator_line(false)
                     .show(ui, |ui| shell::queue_drawer(self, ui));
             }
             let main_right = ui.available_rect_before_wrap().right();
             egui::CentralPanel::default()
-                .frame(egui::Frame::new().inner_margin(egui::Margin { left: 28, right: 28, top: titlebar::top_margin(14, 42.0), bottom: 0 }))
+                .frame(egui::Frame::new().inner_margin(egui::Margin { left: 28, right: 28, top: titlebar::top_margin(&ctx, 14, 42.0), bottom: 0 }))
                 .show(ui, |ui| {
                     shell::top_bar(self, ui);
                     ui.add_space(2.0);
@@ -1323,7 +1362,29 @@ impl eframe::App for App {
                         shell::player_bar(self, ui, now, true);
                     });
                 });
-        }
+            if q > 0.01 && overlay_queue {
+                // At the minimum window width a docked queue leaves too little space
+                // for search and transport. Float the same drawer above the page.
+                let top = section.top() + titlebar::content_top(&ctx) + 6.0;
+                let size = egui::vec2(320.0, (strip.top() - top - 8.0).max(0.0));
+                let rect = egui::Rect::from_min_size(egui::pos2(section.right() - (size.x + 12.0) * q, top), size);
+                egui::Area::new(egui::Id::unique("compact-queue"))
+                    .fixed_pos(rect.min)
+                    .constrain(false)
+                    .order(egui::Order::Middle)
+                    .show(&ctx, |ui| {
+                        ui.set_clip_rect(section);
+                        ui.set_min_size(rect.size());
+                        ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
+                            notes::surface()
+                                .shadow(egui::epaint::Shadow { offset: [0, 5], blur: 18, spread: 0, color: theme::shade(0.22) })
+                                .inner_margin(egui::Margin::symmetric(14, 16))
+                                .show(ui, |ui| shell::queue_drawer(self, ui));
+                        });
+                    });
+            }
+            history_rect
+        } else { None };
         if np > 0.001 {
             let pages = theme::set_mode(&ctx, false);
             nowplaying::overlay(self, &ctx, now);
@@ -1335,6 +1396,17 @@ impl eframe::App for App {
         if let Some(url) = self.share_pending.take() { ctx.copy_text(url); }
         shell::suggestions(self, &ctx);
         shell::toast(self, &ctx, now);
+
+        #[cfg(target_os = "macos")]
+        if let Some(chrome) = &self.macos_chrome {
+            // AppKit overlays the GPU view. Keep its controls behind egui's
+            // interaction boundary whenever a modal, menu or Now Playing takes over.
+            let blocked = self.np_open || np > 0.001 || self.dialog.is_some()
+                || ctx.memory(|m| m.top_modal_layer().is_some()) || egui::Popup::is_any_open(&ctx);
+            chrome.layout_history(&ctx, history_rect.filter(|_| !blocked), !self.back.is_empty(), !self.forward.is_empty());
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = history_rect;
 
         // The player keeps the window buttons too: the top right stays the window's.
         titlebar::window_buttons(&ctx);

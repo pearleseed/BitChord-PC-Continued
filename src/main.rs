@@ -22,6 +22,8 @@ mod jsc;
 mod lastfm;
 mod login;
 mod lyrics;
+#[cfg(target_os = "macos")]
+mod macos_chrome;
 mod media;
 mod model;
 mod motion;
@@ -97,6 +99,10 @@ fn main() -> eframe::Result {
         // Windows: the app draws its own title bar (see `ui::titlebar`).
         .with_decorations(!ui::custom_titlebar())
         .with_icon(appicon::get(appicon::load(&data_dir())).icon_data().expect("bundled icons are valid PNGs"));
+    #[cfg(target_os = "macos")]
+    {
+        viewport = viewport.with_fullsize_content_view(true).with_titlebar_shown(false).with_title_shown(false);
+    }
     if background {
         viewport = viewport.with_position([-4000.0, 0.0]).with_inner_size([1920.0, 1057.0]).with_active(false).with_taskbar(false);
     }
@@ -202,14 +208,17 @@ fn main() -> eframe::Result {
                 _ => None,
             };
 
-            Ok(Box::new(ui::App::new(
+            let app = ui::App::new(
                 backend,
                 audio,
                 ui::Channels { resp_rx, audio_rx, media_rx },
                 media,
                 bg,
                 cc.storage,
-            )))
+            );
+            #[cfg(target_os = "macos")]
+            let app = app.with_macos_chrome(macos_chrome::Chrome::new(cc));
+            Ok(Box::new(app))
         }),
     );
     // A wgpu window that won't open would fail the same way at every launch: go back

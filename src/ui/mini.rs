@@ -264,6 +264,9 @@ impl Mini {
     /// The new layout fades in from `base` (the background's own colour): drawn over
     /// everything, since pages and popups paint on layers of their own.
     pub fn fade_in(&self, ctx: &egui::Context, now: f64, base: Color32) {
+        if theme::reduce_motion() {
+            return;
+        }
         let t = ((now - self.shown_at) / 0.18).clamp(0.0, 1.0) as f32;
         if t >= 1.0 {
             return;

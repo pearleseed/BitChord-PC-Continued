@@ -315,7 +315,17 @@ impl App {
             self.mini.request(true);
             return;
         }
+        #[cfg(target_os = "macos")]
+        if on && ctx.input(|i| i.viewport().fullscreen == Some(true)) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+            self.mini.request(true);
+            return;
+        }
         self.mini.toggle(ctx, now);
+        #[cfg(target_os = "macos")]
+        if let Some(chrome) = &self.macos_chrome {
+            chrome.set_compact(on);
+        }
     }
 
     pub(super) fn set_fullscreen(&mut self, ctx: &egui::Context, on: bool) {

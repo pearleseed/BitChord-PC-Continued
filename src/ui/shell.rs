@@ -69,7 +69,7 @@ pub fn background(app: &mut App, ui: &mut Ui, screen: Rect, now: f64, only: Opti
     let dim = if light { 1.0 } else { look.app.page_dim.unwrap_or(b.page_dim).clamp(0.02, 1.0) };
     // Now playing animates the shader itself, so keep the clock running for it too.
     let animated = matches!(b.mode, BgMode::Kawarp | BgMode::CoverFullbleed) && b.speed > 0.0;
-    let moving = app.anim_bg && animated && app.playing();
+    let moving = app.anim_bg && animated && app.playing() && !theme::reduce_motion();
     if moving {
         app.bg_time += dt * b.speed as f64;
     }
@@ -85,7 +85,7 @@ pub fn background(app: &mut App, ui: &mut Ui, screen: Rect, now: f64, only: Opti
             // The crossfade to new art finishes even while paused.
             ui.ctx().request_repaint_after(std::time::Duration::from_millis(33));
         }
-        let level = if app.reactive_bg && app.playing() { app.audio.status.level() * b.reactive } else { 0.0 };
+        let level = if app.reactive_bg && app.playing() && !theme::reduce_motion() { app.audio.status.level() * b.reactive } else { 0.0 };
         let still = mode == BgMode::CoverStatic;
         bg.paint(
             &painter,
@@ -109,6 +109,11 @@ pub fn background(app: &mut App, ui: &mut Ui, screen: Rect, now: f64, only: Opti
     } else if mode != BgMode::Solid {
         // Keep text readable: darken toward the bottom and under the sidebar.
         vgradient(&painter, screen, theme::shade(0.12), theme::shade(0.55));
+    }
+    if theme::macos_default() {
+        // A restrained cover tint lets the artwork and foreground controls carry
+        // the color. The stronger cover treatment belongs to Now Playing.
+        painter.rect_filled(screen, 0.0, theme::with_alpha(theme::bg(), 0.84));
     }
 }
 
@@ -136,7 +141,8 @@ fn nav_bg(ui: &Ui, look: NavLook, rect: Rect, h: f32, s: f32) -> Color32 {
     let icon_fg = theme::lerp_color(theme::text_dim(), theme::text(), (h + s).min(1.0));
     match look.style {
         NavStyle::Pill => {
-            ui.painter().rect_filled(rect, nav_r, theme::glass(0.05 * h + 0.10 * s));
+            let selection = if theme::increase_contrast() { 0.24 } else if cfg!(target_os = "macos") { 0.13 } else { 0.10 };
+            ui.painter().rect_filled(rect, nav_r, theme::glass(0.05 * h + selection * s));
             icon_fg
         }
         NavStyle::Accent => {
@@ -155,32 +161,39 @@ fn nav_bg(ui: &Ui, look: NavLook, rect: Rect, h: f32, s: f32) -> Color32 {
 
 /// Sidebar width expanded and collapsed to an icon rail (points).
 pub const SIDEBAR_W: f32 = 236.0;
-pub const RAIL_W: f32 = 76.0;
+pub const RAIL_W: f32 = if cfg!(target_os = "macos") { 96.0 } else { 76.0 };
 
 /// How collapsed the sidebar is, 0 (full) to 1 (icon rail), eased over the toggle.
 pub fn sidebar_collapse(app: &App, ctx: &egui::Context) -> f32 {
-    let t = ctx.animate_bool_with_time(egui::Id::unique("sidebar-collapse"), app.sidebar_collapsed, 0.28 * theme::SPEED);
+    let t = ctx.animate_bool_with_time(egui::Id::unique("sidebar-collapse"), app.sidebar_collapsed, theme::motion_time(0.28));
     // Ease in-out: starts and lands gently in both directions.
     t * t * (3.0 - 2.0 * t)
 }
 
 /// The small chevron pair that walks the page history, on the logo's line at the rail's
 /// top right.
-fn history_button(ui: &mut Ui, glyph: char, name: &str) -> bool {
-    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(22.0), Sense::click());
-    let resp = named(resp, name).on_hover_text(name).on_hover_cursor(egui::CursorIcon::PointingHand);
+fn history_button(ui: &mut Ui, glyph: char, name: &str, enabled: bool) -> bool {
+    let (rect, resp) = ui.add_enabled_ui(enabled, |ui| ui.allocate_exact_size(Vec2::splat(22.0), Sense::click())).inner;
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, enabled, name));
+    let resp = resp.on_hover_text(name);
+    let resp = if enabled { resp.on_hover_cursor(egui::CursorIcon::PointingHand) } else { resp };
     let h = theme::anim_bool(ui.ctx(), resp.id.with("h"), resp.hovered(), 0.15);
     if h > 0.0 {
         ui.painter().circle_filled(rect.center(), 11.0, theme::glass(0.10 * h));
     }
-    icon_at(ui, rect.center(), glyph, 16.0, theme::lerp_color(theme::text_dim(), theme::text(), h));
+    let tint = if enabled { theme::lerp_color(theme::text_dim(), theme::text(), h) } else { theme::glass(0.24) };
+    icon_at(ui, rect.center(), glyph, 16.0, tint);
     resp.clicked()
 }
 
 /// One layout for both states, so collapsing animates: the panel narrows while icons
 /// and covers keep their column (24 pt from the left) and the labels fade and clip.
-pub fn sidebar(app: &mut App, ui: &mut Ui) {
-    const ICON_X: f32 = 24.0;
+pub fn sidebar(app: &mut App, ui: &mut Ui) -> Option<Rect> {
+    const MAC: bool = cfg!(target_os = "macos");
+    const ICON_X: f32 = if MAC { 20.0 } else { 24.0 };
+    if MAC {
+        ui.spacing_mut().item_spacing.y = 3.0;
+    }
     let t = sidebar_collapse(app, ui.ctx());
     let collapsed = app.sidebar_collapsed;
     // Labels fade out over the first two thirds of collapsing (and back in late).
@@ -188,45 +201,86 @@ pub fn sidebar(app: &mut App, ui: &mut Ui) {
     // Content width when expanded: text keeps its truncation while the panel narrows.
     let full_w = ui.available_width() + (SIDEBAR_W - RAIL_W) * t;
 
-    // Logo, with the page history right-aligned on the same line.
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 0.0;
-        ui.add_space(8.0);
-        let (r, resp) = ui.allocate_exact_size(vec2(32.0, 32.0), Sense::click());
-        mark(ui, Rect::from_center_size(r.center(), vec2(30.0, 20.0)), theme::with_alpha(theme::text(), a));
-        let resp = named(resp, "Home");
-        let resp = if collapsed { resp } else { resp.on_hover_cursor(egui::CursorIcon::PointingHand) };
-        if resp.clicked() && !collapsed {
-            app.actions.push(Action::Go(Page::Home));
+    #[cfg(target_os = "macos")]
+    let native_history = app.macos_chrome.is_some();
+    #[cfg(not(target_os = "macos"))]
+    let native_history = false;
+
+    let history_rect = if native_history {
+        let (row, _) = ui.allocate_exact_size(vec2(ui.available_width(), 34.0), Sense::hover());
+        let width = 68.0_f32.min(row.width());
+        // Align to the row's leading edge, with equal margins in the compact rail.
+        let left = row.left() + (row.width() - width) * 0.5 * t;
+        let rect = Rect::from_min_size(pos2(left, row.top()), vec2(width, row.height()));
+        // AccessKit owns the renderer view's accessibility tree. Mirror the
+        // native buttons here so Tab and VoiceOver can use the same history.
+        let blocked = app.np_open || app.dialog.is_some();
+        for (i, (label, enabled)) in [("Back", !app.back.is_empty()), ("Forward", !app.forward.is_empty())].into_iter().enumerate() {
+            let hit = Rect::from_min_size(rect.min + vec2(i as f32 * width / 2.0, 0.0), vec2(width / 2.0, rect.height()));
+            let enabled = enabled && !blocked;
+            let mut builder = egui::UiBuilder::new().max_rect(hit).id_salt(label);
+            if !enabled {
+                builder = builder.disabled();
+            }
+            let child = ui.new_child(builder);
+            let response = child.interact(hit, child.scope_id().with("history"), Sense::click());
+            response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, enabled, label));
+            if response.has_focus() {
+                ui.painter().rect_stroke(hit.expand(2.0), 18.0, egui::Stroke::new(2.0, app.accent_color()), egui::StrokeKind::Outside);
+            }
+            if response.clicked() {
+                if i == 0 { app.nav_back(); } else { app.nav_forward(); }
+            }
         }
-        // Drifts to the rail's edge as it collapses.
-        ui.add_space(((ui.available_width() - 48.0) * (1.0 - t)).max(0.0));
-        ui.spacing_mut().item_spacing.x = 4.0;
-        if history_button(ui, icon::CHEVRON_LEFT, "Back") {
-            app.nav_back();
-        }
-        if history_button(ui, icon::CHEVRON_RIGHT, "Forward") {
-            app.nav_forward();
-        }
-    });
-    ui.add_space(14.0);
+        Some(rect)
+    } else {
+        // The other desktop platforms keep their logo and in-app controls.
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 0.0;
+            ui.add_space(8.0);
+            let (r, resp) = ui.allocate_exact_size(vec2(32.0, 32.0), Sense::click());
+            mark(ui, Rect::from_center_size(r.center(), vec2(30.0, 20.0)), theme::with_alpha(theme::text(), a));
+            let resp = named(resp, "Home");
+            let resp = if collapsed { resp } else { resp.on_hover_cursor(egui::CursorIcon::PointingHand) };
+            if resp.clicked() && !collapsed {
+                app.actions.push(Action::Go(Page::Home));
+            }
+            // Drifts to the rail's edge as it collapses.
+            ui.add_space(((ui.available_width() - 48.0) * (1.0 - t)).max(0.0));
+            ui.spacing_mut().item_spacing.x = 4.0;
+            if history_button(ui, icon::CHEVRON_LEFT, "Back", app.np_open || !app.back.is_empty()) {
+                app.nav_back();
+            }
+            if history_button(ui, icon::CHEVRON_RIGHT, "Forward", !app.forward.is_empty()) {
+                app.nav_forward();
+            }
+        });
+        None
+    };
+    ui.add_space(if MAC { 8.0 } else { 14.0 });
 
     let mut go_to: Option<Page> = None;
     let look = NavLook::of(app);
     let nav = |ui: &mut Ui, glyph: &'static [u8], size: f32, label: &str, page: Page, selected: bool, go_to: &mut Option<Page>| {
-        let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 42.0), Sense::click());
-        let mut resp = named(resp, label).on_hover_cursor(egui::CursorIcon::PointingHand);
+        let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), if MAC { 32.0 } else { 42.0 }), Sense::click());
+        resp.widget_info(|| egui::WidgetInfo::selected(egui::Role::Button, true, selected, label));
+        let mut resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
         if collapsed {
             resp = resp.on_hover_text(label);
         }
         let h = theme::anim_bool(ui.ctx(), resp.id.with("h"), resp.hovered(), 0.15);
         let s = theme::anim_bool(ui.ctx(), resp.id.with("s"), selected, 0.2);
         let icon_fg = nav_bg(ui, look, rect, h, s);
+        if MAC && resp.has_focus() {
+            ui.painter().rect_stroke(rect, look.radius, egui::Stroke::new(1.5, look.accent), egui::StrokeKind::Inside);
+        }
         glyphs::draw(ui, pos2(rect.left() + ICON_X, rect.center().y), size, glyph, icon_fg);
         if a > 0.0 {
             let fg = theme::lerp_color(theme::text_dim(), theme::text(), (h + s).min(1.0));
-            let font = if selected { theme::semibold(15.0) } else { theme::regular(15.0) };
-            ui.painter().text(pos2(rect.left() + 48.0, rect.center().y), Align2::LEFT_CENTER, label, font, theme::with_alpha(fg, a));
+            let size = if MAC { 13.5 } else { 15.0 };
+            let font = if selected { theme::semibold(size) } else { theme::regular(size) };
+            let label_x = if MAC { 40.0 } else { 48.0 };
+            ui.painter().text(pos2(rect.left() + label_x, rect.center().y), Align2::LEFT_CENTER, label, font, theme::with_alpha(fg, a));
         }
         if resp.clicked() {
             *go_to = Some(page);
@@ -241,10 +295,14 @@ pub fn sidebar(app: &mut App, ui: &mut Ui) {
     nav(ui, glyphs::LIBRARY, APPLE, "Library", Page::Library(LibTab::Playlists), matches!(p, Page::Library(_)), &mut go_to);
     nav(ui, glyphs::DOWNLOAD, APPLE, "Downloads", Page::Downloads, p == Page::Downloads, &mut go_to);
 
-    ui.add_space(14.0);
-    let (line, _) = ui.allocate_exact_size(vec2(ui.available_width(), 1.0), Sense::hover());
-    ui.painter().rect_filled(line, 0.0, theme::glass(0.08));
-    ui.add_space(14.0 - 4.0 * t);
+    if MAC {
+        ui.add_space(18.0);
+    } else {
+        ui.add_space(14.0);
+        let (line, _) = ui.allocate_exact_size(vec2(ui.available_width(), 1.0), Sense::hover());
+        ui.painter().rect_filled(line, 0.0, theme::glass(0.08));
+        ui.add_space(14.0 - 4.0 * t);
+    }
 
     // Playlists that appeared since the order was last changed join it at the end, so a
     // drag can place any of them.
@@ -420,6 +478,7 @@ pub fn sidebar(app: &mut App, ui: &mut Ui) {
             app.actions.push(Action::Go(page));
         }
     }
+    history_rect
 }
 
 // ------------------------------------------------------------------ top bar
@@ -468,7 +527,12 @@ pub fn search_field(app: &mut App, ui: &mut Ui, width: f32) {
     let focus = theme::anim_bool(ui.ctx(), "search-focus", app.search_focused, 0.2);
     ui.painter().rect_filled(rect, 21.0, theme::glass(0.09 + 0.05 * focus));
     if focus > 0.0 {
-        ui.painter().rect_stroke(rect, 21.0, egui::Stroke::new(1.0, theme::glass(0.25 * focus)), egui::StrokeKind::Inside);
+        let stroke = if cfg!(target_os = "macos") {
+            egui::Stroke::new(2.0, theme::with_alpha(app.accent_color(), 0.85 * focus))
+        } else {
+            egui::Stroke::new(1.0, theme::glass(0.25 * focus))
+        };
+        ui.painter().rect_stroke(rect, 21.0, stroke, egui::StrokeKind::Inside);
     }
     icon_at(ui, pos2(rect.left() + 22.0, rect.center().y), icon::SEARCH, 17.0, theme::text_dim());
     let clearable = !app.search_text.is_empty();
@@ -683,7 +747,7 @@ fn suggestion_text(ui: &Ui, pos: Pos2, text: &str, typed: &str, width: f32) {
 /// line in the middle, favourites / lyrics / queue / volume on the right.
 pub fn player_bar(app: &mut App, ui: &mut Ui, now: f64, frosted: bool) {
     let full = ui.max_rect();
-    if frosted {
+    if frosted && !theme::reduce_transparency() {
         // The page scrolls on under this strip: fade it out rather than end it at the
         // player's edge. Clicks in the fade stay with the player, not the rows beneath.
         vgradient(ui.painter(), full, theme::panel(0.0), theme::panel(0.66));
@@ -693,14 +757,20 @@ pub fn player_bar(app: &mut App, ui: &mut Ui, now: f64, frosted: bool) {
     let w = (full.width() - 24.0).min(668.0);
     let cap = Rect::from_min_size(pos2(full.center().x - w / 2.0, full.bottom() - 16.0 - H), vec2(w, H));
     let ctx = ui.ctx().clone();
-    widgets::soft_shadow(ui, cap, H / 2.0, 20.0, 0.45);
-    // Frosted: the page's colours show through a milky pane, with a lit top half and
-    // a bright rim standing in for the blur egui can't do.
-    ui.painter().rect_filled(cap, H / 2.0, theme::panel(0.88));
-    let top = Rect::from_min_max(cap.min, pos2(cap.max.x, cap.min.y + H * 0.55));
-    ui.painter().rect_filled(top, egui::CornerRadius { nw: 28, ne: 28, sw: 0, se: 0 }, theme::glass(0.07));
-    ui.painter().rect_stroke(cap, H / 2.0, egui::Stroke::new(1.0, theme::glass(0.2)), egui::StrokeKind::Inside);
-    ui.painter().hline(cap.x_range().shrink(26.0), cap.top() + 1.0, egui::Stroke::new(1.0, theme::glass(0.24)));
+    if theme::macos_default() {
+        widgets::soft_shadow(ui, cap, H / 2.0, 14.0, 0.23);
+        let alpha = if theme::reduce_transparency() { 1.0 } else { 0.96 };
+        ui.painter().rect_filled(cap, H / 2.0, theme::with_alpha(theme::surface_fill(), alpha));
+        let edge = if theme::increase_contrast() { 0.32 } else { 0.10 };
+        ui.painter().rect_stroke(cap, H / 2.0, egui::Stroke::new(1.0, theme::glass(edge)), egui::StrokeKind::Inside);
+    } else {
+        widgets::soft_shadow(ui, cap, H / 2.0, 20.0, 0.45);
+        ui.painter().rect_filled(cap, H / 2.0, theme::panel(0.88));
+        let top = Rect::from_min_max(cap.min, pos2(cap.max.x, cap.min.y + H * 0.55));
+        ui.painter().rect_filled(top, egui::CornerRadius { nw: 28, ne: 28, sw: 0, se: 0 }, theme::glass(0.07));
+        ui.painter().rect_stroke(cap, H / 2.0, egui::Stroke::new(1.0, theme::glass(0.2)), egui::StrokeKind::Inside);
+        ui.painter().hline(cap.x_range().shrink(26.0), cap.top() + 1.0, egui::Stroke::new(1.0, theme::glass(0.24)));
+    }
 
     let status = app.audio.status.clone();
     // An Automix handoff keeps the outgoing song on this strip until the next one is

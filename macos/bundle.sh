@@ -12,7 +12,8 @@ out=$3
 kind=$4
 [ -n "$bin" ] && [ -n "$version" ] && [ -n "$out" ] || { echo "usage: $0 <binary> <version> <out dir>"; exit 1; }
 here=$(cd "$(dirname "$0")" && pwd)
-icon="$here/../assets/icon/icon.png"
+icon="$here/../assets/icon/macos.png"
+[ -f "$icon" ] || icon="$here/../assets/icon/icon.png"
 app="$out/bitchord.app"
 
 rm -rf "$app"
@@ -21,12 +22,12 @@ cp "$bin" "$app/Contents/MacOS/bitchord"
 chmod 755 "$app/Contents/MacOS/bitchord"
 sed "s/@VERSION@/$version/g" "$here/Info.plist" > "$app/Contents/Info.plist"
 
-# The Dock and Finder icon, at each size iconutil takes up to the 256 px source.
+# The Dock and Finder icon, at each size iconutil takes up to 1024 px (512@2x).
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 set=$tmp/bitchord.iconset
 mkdir "$set"
-for spec in 16:16x16 32:16x16@2x 32:32x32 64:32x32@2x 128:128x128 256:128x128@2x 256:256x256; do
+for spec in 16:16x16 32:16x16@2x 32:32x32 64:32x32@2x 128:128x128 256:128x128@2x 256:256x256 512:256x256@2x 512:512x512 1024:512x512@2x; do
     sips -z "${spec%%:*}" "${spec%%:*}" "$icon" --out "$set/icon_${spec#*:}.png" >/dev/null
 done
 iconutil -c icns "$set" -o "$app/Contents/Resources/bitchord.icns"

@@ -995,7 +995,7 @@ pub fn h_scroll<R>(ui: &mut Ui, id: &str, nudge: i32, count: usize, item_width: 
     }
     let mut area = egui::ScrollArea::horizontal().id_salt(sid).scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden);
     if let Some(t) = target {
-        let v = ui.ctx().animate_value_with_time(anim_id, t, 0.35 * theme::SPEED);
+        let v = ui.ctx().animate_value_with_time(anim_id, t, theme::motion_time(0.35));
         area = area.horizontal_scroll_offset(v);
         if (v - t).abs() < 0.5 {
             ui.ctx().data_mut(|d| d.remove::<f32>(target_id));

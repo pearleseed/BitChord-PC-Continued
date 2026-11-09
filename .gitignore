@@ -2,6 +2,7 @@
 
 installer/Output/
 .claude/
+.superpowers/
 
 server/target/
 server/smoke/target/

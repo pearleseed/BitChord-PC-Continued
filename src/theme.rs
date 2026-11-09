@@ -49,21 +49,53 @@ pub fn on_text() -> Color32 {
 
 /// Least important text: counts, hints, placeholders.
 pub fn text_faint() -> Color32 {
+    if increase_contrast() {
+        return text_dim();
+    }
     if light() { TEXT_FAINT_LIGHT } else { TEXT_FAINT }
 }
 
 /// The window's base colour, under the background.
 pub fn bg() -> Color32 {
+    if macos_default() {
+        return Color32::from_gray(if light() { 249 } else { 30 });
+    }
     if light() { BG_LIGHT } else { BG }
 }
 
+pub fn macos_default() -> bool {
+    cfg!(target_os = "macos") && crate::preset::active().id == crate::preset::DEFAULT_ID
+}
+
+pub fn sidebar_fill() -> Color32 {
+    let color = Color32::from_gray(if light() { 237 } else { 39 });
+    if reduce_transparency() { color } else { with_alpha(color, 0.92) }
+}
+
+fn display_preference(mask: u32) -> bool {
+    #[cfg(target_os = "macos")]
+    { crate::macos_chrome::preferences() & mask != 0 }
+    #[cfg(not(target_os = "macos"))]
+    { let _ = mask; false }
+}
+
+pub fn reduce_motion() -> bool { display_preference(1) }
+pub fn reduce_transparency() -> bool { display_preference(2) }
+pub fn increase_contrast() -> bool { display_preference(4) }
+
 /// Menus and popups.
 pub fn menu_fill() -> Color32 {
+    if macos_default() {
+        return surface_fill();
+    }
     if light() { Color32::WHITE } else { Color32::from_rgb(38, 34, 42) }
 }
 
 /// Dialogs and cards that float over the page.
 pub fn surface_fill() -> Color32 {
+    if macos_default() {
+        return Color32::from_gray(if light() { 253 } else { 45 });
+    }
     if light() { Color32::from_rgb(252, 251, 253) } else { Color32::from_rgb(28, 24, 32) }
 }
 
@@ -80,6 +112,9 @@ pub fn glass(a: f32) -> Color32 {
 /// A panel over the background (sidebar, player bar, queue): darker than the page at
 /// `a`, or in light mode lighter.
 pub fn panel(a: f32) -> Color32 {
+    if reduce_transparency() && a > 0.0 {
+        return surface_fill();
+    }
     if light() { Color32::from_white_alpha((a.clamp(0.0, 1.0) * 255.0) as u8) } else { shade(a) }
 }
 
@@ -88,6 +123,9 @@ static DIM: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32
 
 /// Secondary text colour (themes may tint it).
 pub fn text_dim() -> Color32 {
+    if increase_contrast() {
+        return lerp_color(if light() { TEXT_DIM_LIGHT } else { TEXT_DIM }, text(), 0.35);
+    }
     if light() {
         return TEXT_DIM_LIGHT;
     }
@@ -139,6 +177,7 @@ impl Appearance {
 
 /// Windows' "app mode" (Settings › Personalization › Colors), read again every couple
 /// of seconds so switching it there shows without a restart. `None` off Windows.
+#[cfg(not(target_os = "macos"))]
 fn system_light() -> Option<bool> {
     use std::time::{Duration, Instant};
     static MODE: std::sync::Mutex<Option<(Instant, Option<bool>)>> = std::sync::Mutex::new(None);
@@ -151,6 +190,11 @@ fn system_light() -> Option<bool> {
             m
         }
     }
+}
+
+#[cfg(target_os = "macos")]
+fn system_light() -> Option<bool> {
+    Some(display_preference(8))
 }
 
 #[cfg(windows)]
@@ -167,7 +211,7 @@ fn read_system_light() -> Option<bool> {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 fn read_system_light() -> Option<bool> {
     None
 }
@@ -272,11 +316,15 @@ pub const SPEED: f32 = 0.65;
 
 /// Animate toward `target` (eased), keyed by `id`. Requests repaints while moving.
 pub fn anim(ctx: &egui::Context, id: impl std::hash::Hash + std::fmt::Debug, target: f32, secs: f32) -> f32 {
-    ctx.animate_value_with_time(egui::Id::unique(id), target, secs * SPEED)
+    ctx.animate_value_with_time(egui::Id::unique(id), target, motion_time(secs))
 }
 
 pub fn anim_bool(ctx: &egui::Context, id: impl std::hash::Hash + std::fmt::Debug, on: bool, secs: f32) -> f32 {
-    ease_out(ctx.animate_bool_with_time(egui::Id::unique(id), on, secs * SPEED))
+    ease_out(ctx.animate_bool_with_time(egui::Id::unique(id), on, motion_time(secs)))
+}
+
+pub fn motion_time(secs: f32) -> f32 {
+    if reduce_motion() { 0.0 } else { secs * SPEED }
 }
 
 // ------------------------------------------------------------------ type
@@ -853,6 +901,10 @@ pub fn apply_chrome(ctx: &egui::Context, p: &crate::preset::Preset) {
 }
 
 pub fn install_style(ctx: &egui::Context) {
+    #[cfg(target_os = "macos")]
+    // AppKit follows the effective page appearance. egui's theme stays fixed
+    // because we supply its palette ourselves.
+    ctx.options_mut(|options| options.sync_window_theme = false);
     ctx.set_theme(egui::Theme::Dark);
     ctx.global_style_mut(|s| {
         s.spacing.item_spacing = egui::vec2(8.0, 6.0);
@@ -864,7 +916,15 @@ pub fn install_style(ctx: &egui::Context) {
         s.text_styles.insert(egui::TextStyle::Small, regular(12.0));
         s.visuals = visuals();
         s.interaction.selectable_labels = false;
-        s.animation_time = 0.18 * SPEED;
+        s.animation_time = motion_time(0.18);
+    });
+}
+
+#[cfg(target_os = "macos")]
+pub fn refresh_accessibility(ctx: &egui::Context) {
+    ctx.global_style_mut(|s| {
+        s.visuals = visuals();
+        s.animation_time = motion_time(0.18);
     });
 }
 
@@ -883,7 +943,11 @@ fn visuals() -> egui::Visuals {
     v.window_corner_radius = pr;
     v.menu_corner_radius = pr;
     v.window_stroke = egui::Stroke::new(1.0, glass(0.08));
-    v.popup_shadow = egui::epaint::Shadow { offset: [0, 8], blur: 28, spread: 0, color: shade(if light() { 0.16 } else { 0.5 }) };
+    v.popup_shadow = if macos_default() {
+        egui::epaint::Shadow { offset: [0, 4], blur: 18, spread: 0, color: shade(if light() { 0.13 } else { 0.36 }) }
+    } else {
+        egui::epaint::Shadow { offset: [0, 8], blur: 28, spread: 0, color: shade(if light() { 0.16 } else { 0.5 }) }
+    };
     let r = egui::CornerRadius::same(p.chrome.radius.clamp(2.0, 28.0) as u8);
     for (w, fill) in [
         (&mut v.widgets.inactive, glass(0.08)),

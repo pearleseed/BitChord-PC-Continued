@@ -157,6 +157,13 @@ fn rule_color() -> Color32 {
 }
 
 pub(super) fn surface() -> egui::Frame {
+    if cfg!(target_os = "macos") {
+        return egui::Frame::new()
+            .fill(theme::surface_fill())
+            .stroke(Stroke::new(1.0, theme::glass(if theme::increase_contrast() { 0.28 } else { 0.10 })))
+            .corner_radius(16)
+            .shadow(egui::epaint::Shadow { offset: [0, 12], blur: 36, spread: 0, color: theme::shade(0.32) });
+    }
     egui::Frame::new()
         .fill(if theme::light() { theme::surface_fill() } else { Color32::from_gray(28) })
         .stroke(Stroke::new(1.0, rule_color()))

@@ -47,8 +47,23 @@ pub fn buttons_rect(ctx: &egui::Context) -> Option<Rect> {
 
 /// The top margin above a row `row` tall at the top of the window: `normal`, or with the
 /// app's title bar what centres it on the window buttons' line.
-pub fn top_margin(normal: i8, row: f32) -> i8 {
-    if custom() { ((HEIGHT - row) / 2.0).round() as i8 } else { normal }
+pub fn top_margin(ctx: &egui::Context, normal: i8, row: f32) -> i8 {
+    if custom() {
+        ((HEIGHT - row) / 2.0).round() as i8
+    } else if cfg!(target_os = "macos") {
+        (content_top(ctx).ceil() + 6.0) as i8
+    } else {
+        normal
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub fn set_content_top(ctx: &egui::Context, inset: f32) {
+    ctx.data_mut(|d| d.insert_temp(Id::unique("native-titlebar-inset"), inset));
+}
+
+pub fn content_top(ctx: &egui::Context) -> f32 {
+    ctx.data(|d| d.get_temp::<f32>(Id::unique("native-titlebar-inset"))).unwrap_or(0.0)
 }
 
 /// How much of `row` (a strip along the top) the window buttons cover from its right.
