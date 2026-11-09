@@ -12,7 +12,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use base64::Engine;
 use futures_util::{StreamExt, TryStreamExt, stream};
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use serde_json::{Value, json};
 use sha1::Sha1;
 

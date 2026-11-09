@@ -384,8 +384,7 @@ fn disc_at(ui: &Ui, center: Pos2, r: f32, url: &str, uv: Rect, angle: f32, tint:
     let Ok(egui::load::TexturePoll::Ready { texture }) = egui::Image::new(url).load_for_size(ui.ctx(), Vec2::splat(r * 2.0)) else { return false };
     let (uc, uh) = (uv.center(), uv.width() / 2.0);
     let mut mesh = egui::Mesh::with_texture(texture.id);
-    mesh.colored_vertex(center, tint);
-    mesh.vertices[0].uv = uc;
+    mesh.vertices.push(egui::epaint::Vertex { pos: center, uv: uc, color: tint });
     let n = 96;
     for i in 0..=n {
         let a = i as f32 / n as f32 * std::f32::consts::TAU;
@@ -698,13 +697,6 @@ pub fn play_triangle(ui: &Ui, center: Pos2, r: f32, color: Color32) {
         center + vec2(-r * 0.6, r),
     ];
     ui.painter().add(egui::Shape::convex_polygon(pts, color, egui::Stroke::NONE));
-}
-
-pub fn pause_bars(ui: &Ui, center: Pos2, r: f32, color: Color32) {
-    for dx in [-r * 0.45, r * 0.45] {
-        let bar = Rect::from_center_size(center + vec2(dx, 0.0), vec2(r * 0.42, r * 1.7));
-        ui.painter().rect_filled(bar, 1.5, color);
-    }
 }
 
 // ------------------------------------------------------------------ playing bars

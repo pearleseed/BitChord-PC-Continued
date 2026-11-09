@@ -630,7 +630,9 @@ fn collection(app: &mut App, ui: &mut Ui, id: &str, now: f64) {
         ui.vertical(|ui| {
             ui.set_max_width(ui.available_width().min(760.0));
             ui.add_space(24.0);
-            ui.label(RichText::new(if is_album { "ALBUM" } else { "PLAYLIST" }).font(theme::semibold(12.0)).color(theme::text_dim()));
+            let podcast = crate::ytm::is_podcast(id);
+            let kind = if is_album { "ALBUM" } else if podcast { "PODCAST" } else { "PLAYLIST" };
+            ui.label(RichText::new(kind).font(theme::semibold(12.0)).color(theme::text_dim()));
             ui.label(RichText::new(&c.title).font(theme::bold(40.0)).color(theme::text()));
             ui.add_space(2.0);
             let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 20.0), Sense::hover());
@@ -638,7 +640,7 @@ fn collection(app: &mut App, ui: &mut Ui, id: &str, now: f64) {
             let total: u32 = tracks.iter().filter_map(|t| t.duration).sum();
             if total > 0 {
                 ui.label(
-                    RichText::new(format!("{} songs • {} min", tracks.len(), total / 60)).font(theme::regular(13.5)).color(theme::text_faint()),
+                    RichText::new(format!("{} {} • {} min", tracks.len(), if podcast { "episodes" } else { "songs" }, total / 60)).font(theme::regular(13.5)).color(theme::text_faint()),
                 );
             }
             if let Some(d) = c.description.as_deref().filter(|d| !d.trim().is_empty()) {
@@ -652,7 +654,7 @@ fn collection(app: &mut App, ui: &mut Ui, id: &str, now: f64) {
             // saved, removed, edited or deleted.
             let auto = matches!(id, "LM" | "SE");
             let saved = app.library.as_ref().is_some_and(|l| {
-                let cards = if is_album { &l.albums } else { &l.playlists };
+                let cards = if is_album { &l.albums } else if crate::ytm::is_podcast(id) { &l.podcasts } else { &l.playlists };
                 cards.iter().any(|card| card.target == target)
             });
             // Saving only applies to someone else's playlist or an album.
@@ -739,7 +741,7 @@ fn collection(app: &mut App, ui: &mut Ui, id: &str, now: f64) {
             egui::TextEdit::singleline(query)
                 .hint_text(egui::RichText::new("Search in this list").color(theme::text_faint()))
                 .font(theme::regular(14.0))
-                .vertical_align(egui::Align::Center)
+                .align(egui::Align2::LEFT_CENTER)
                 .frame(egui::Frame::NONE)
                 .desired_width(inner.width()),
         );
@@ -962,7 +964,7 @@ fn library(app: &mut App, ui: &mut Ui, tab: LibTab, now: f64) {
     ui.add_space(12.0);
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 10.0;
-        for (t, label) in [(LibTab::Playlists, "Playlists"), (LibTab::Songs, "Liked songs"), (LibTab::Albums, "Albums"), (LibTab::History, "History"), (LibTab::Uploads, "Uploads")] {
+        for (t, label) in [(LibTab::Playlists, "Playlists"), (LibTab::Songs, "Liked songs"), (LibTab::Albums, "Albums"), (LibTab::Podcasts, "Podcasts"), (LibTab::History, "History"), (LibTab::Uploads, "Uploads")] {
             if chip(ui, label, tab == t).clicked() {
                 // Tabs swap in place (no history entry); the current one refreshes.
                 if tab == t {
@@ -1062,6 +1064,11 @@ fn library(app: &mut App, ui: &mut Ui, tab: LibTab, now: f64) {
                     grid(ui, &lib.playlists, &mut app.actions)
                 }
                 LibTab::Albums => grid(ui, &lib.albums, &mut app.actions),
+                LibTab::Podcasts if lib.podcasts.is_empty() => {
+                    ui.add_space(24.0);
+                    ui.label(RichText::new("Podcasts you save on YouTube Music show up here.").color(theme::text_dim()));
+                }
+                LibTab::Podcasts => grid(ui, &lib.podcasts, &mut app.actions),
                 LibTab::Songs | LibTab::History | LibTab::Uploads => unreachable!(),
             }
         }
@@ -1298,6 +1305,10 @@ fn settings_playback(app: &mut App, ui: &mut Ui) {
             if toggle(ui, &mut app.prefer_atmos, "Prefer Dolby Atmos").changed() {
                 app.backend.set_prefer_atmos(app.prefer_atmos);
             }
+        });
+        divider(ui);
+        setting_row(ui, "Stats for nerds", Some("Show the codec, sample rate and bitrate of what's playing at the foot of the cover in Now Playing, whatever the source."), |ui| {
+            toggle(ui, &mut app.show_nerd_stats, "Stats for nerds");
         });
     });
 }
@@ -1779,13 +1790,6 @@ fn network(app: &mut App, ui: &mut Ui) {
             app.restart(ui.ctx());
         }
     }
-}
-
-/// Paint `v` into `rect`, from the ICO entry that fits its size in physical pixels.
-pub(super) fn paint_app_icon(ui: &Ui, v: &crate::appicon::Variant, rect: Rect) {
-    let px = (rect.width() * ui.ctx().pixels_per_point()).ceil() as u32;
-    let png = v.png(px);
-    egui::Image::from_bytes(format!("bytes://app-icon/{}-{}.png", v.id, png.len()), png).paint_at(ui, rect);
 }
 
 /// The font setting: the theme's own, a bundled face, or one installed on this PC.

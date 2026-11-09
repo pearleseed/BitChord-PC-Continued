@@ -85,7 +85,6 @@ impl Bezier {
 }
 
 pub const EASE: Bezier = Bezier(0.25, 0.1, 0.25, 1.0);
-pub const EASE_IN: Bezier = Bezier(0.42, 0.0, 1.0, 1.0);
 pub const EASE_OUT: Bezier = Bezier(0.0, 0.0, 0.58, 1.0);
 pub const EASE_IN_OUT: Bezier = Bezier(0.42, 0.0, 0.58, 1.0);
 /// `--blyrics-lyric-scroll-timing-function`.
@@ -2362,7 +2361,7 @@ mod tests {
         // Reference values of CSS `ease` (cubic-bezier(0.25, 0.1, 0.25, 1)).
         assert!((EASE.at(0.5) - 0.8024).abs() < 0.002);
         assert!((EASE.at(0.25) - 0.4094).abs() < 0.002);
-        assert!((EASE_IN.at(0.5) - 0.3153).abs() < 0.002);
+        assert!((Bezier(0.42, 0.0, 1.0, 1.0).at(0.5) - 0.3153).abs() < 0.002);
         assert_eq!(EASE.at(0.0), 0.0);
         assert_eq!(EASE.at(1.0), 1.0);
     }

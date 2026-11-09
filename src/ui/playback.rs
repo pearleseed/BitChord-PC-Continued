@@ -6,7 +6,7 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use crate::audio::AudioCmd;
-use crate::backend::{self, Req};
+use crate::backend::{self, PlaybackQuality, Req};
 use crate::lyrics::Lyrics;
 use crate::model::Track;
 
@@ -17,6 +17,14 @@ use super::{App, MixFrom, PlayingAs, Repeat, Session, jam, lyric_prefs};
 /// the first 30% (see `audio::mix_handoff`) and the curves are mirrors, so the next song
 /// becomes the louder of the two at 65% of the mix. That's when the player follows it.
 const MIX_SWITCH: f32 = 0.65;
+
+#[derive(Clone, Copy)]
+pub(super) struct LoadingPlayback {
+    pub at: Duration,
+    pub report: bool,
+    quality: PlaybackQuality,
+    pub trying_standard: bool,
+}
 
 impl App {
     pub fn current(&self) -> Option<&Track> {
@@ -148,7 +156,7 @@ impl App {
         }
         let at = self.audio.status.position();
         self.playing_as = None;
-        if self.playing() || self.buffering {
+        if self.playing() || self.buffering() {
             self.play_current_at(at, false);
         } else {
             self.resume_at = Some(at);
@@ -163,6 +171,42 @@ impl App {
 
     pub(super) fn playing(&self) -> bool {
         self.audio.status.playing.load(Ordering::Relaxed)
+    }
+
+    pub(super) fn buffering(&self) -> bool {
+        self.play_load.is_some()
+    }
+
+    pub(super) fn loading_label(&self) -> Option<&'static str> {
+        self.play_load.map(|loading| {
+            if loading.trying_standard {
+                "Trying YouTube audio…"
+            } else if loading.quality == PlaybackQuality::Standard {
+                "Loading YouTube audio…"
+            } else {
+                "Loading audio…"
+            }
+        })
+    }
+
+    pub(super) fn play_button_label(&self) -> &'static str {
+        if self.buffering() && !self.audio.status.started(self.generation) && !self.jam.guest() {
+            "Cancel loading"
+        } else if self.playing() {
+            "Pause"
+        } else {
+            "Play"
+        }
+    }
+
+    pub(super) fn can_play_standard_now(&self) -> bool {
+        !self.jam.guest() && !self.hires_sources.is_empty() && self.play_load.is_some_and(|l| l.quality != PlaybackQuality::Standard && !l.trying_standard)
+    }
+
+    pub(super) fn play_standard_now(&mut self) {
+        if self.can_play_standard_now() && let Some(load) = self.play_load {
+            self.play_with_quality(load.at, load.report, PlaybackQuality::Standard);
+        }
     }
 
     /// Fetch the current song's art for the background and accent.
@@ -216,7 +260,7 @@ impl App {
         }
         let focused = ctx.input(|i| i.focused);
         let refocused = focused && !std::mem::replace(&mut self.was_focused, focused);
-        let idle = !self.playing() && !self.buffering && !self.jam.active() && self.smoke.is_none();
+        let idle = !self.playing() && !self.buffering() && !self.jam.active() && self.smoke.is_none();
         let due = self.queue_checked.is_none_or(|t| refocused && now - t > 60.0);
         if self.logged_in && idle && due && std::env::var_os("YTM_SMOKE").is_none() {
             self.queue_checked = Some(now);
@@ -228,7 +272,7 @@ impl App {
     /// session, when it played there after anything played here.
     pub(super) fn adopt_server_queue(&mut self, q: crate::ytm::ServerQueue) {
         let Some(track) = q.tracks.get(q.index).cloned() else { return };
-        let idle = !self.playing() && !self.buffering && !self.jam.active();
+        let idle = !self.playing() && !self.buffering() && !self.jam.active();
         // A minute's slack: this app's own plays reach that queue too.
         if !idle || q.watched_at <= self.listened_at + 60 || self.current_id() == Some(track.id.as_str()) {
             return;
@@ -277,7 +321,7 @@ impl App {
         // The player has already run dry; Stop would also reset the position to 0:00.
         self.audio.status.position_ms.store(at.as_millis() as u64, Ordering::Relaxed);
         self.resume_at = Some(at);
-        self.buffering = false;
+        self.play_load = None;
         let title = self.current().map(|t| t.title.clone()).unwrap_or_default();
         self.toast(format!("Lost the connection while playing \"{title}\". Press play to pick up where it stopped."));
     }
@@ -290,6 +334,10 @@ impl App {
     /// Start the current track, opened directly at `at` so nothing plays from 0:00 first.
     /// `report`: a new play for the account's history (not picking up last session's song).
     pub(super) fn play_current_at(&mut self, at: Duration, report: bool) {
+        self.play_with_quality(at, report, PlaybackQuality::Auto);
+    }
+
+    pub(super) fn play_with_quality(&mut self, at: Duration, report: bool, quality: PlaybackQuality) {
         let Some(track) = self.current().cloned() else { return };
         // A natural Automix handoff keeps the outgoing song on screen until the next one
         // is louder (see `MixFrom`); any other play switches at once.
@@ -304,31 +352,49 @@ impl App {
         self.resume_at = None;
         self.resume_counts = false;
         self.generation += 1;
-        self.audio.status.wanted_gen.store(self.generation, Ordering::Relaxed);
+        self.backend.set_play_generation(self.generation);
         self.audio_info = None;
+        self.stream_stats = None;
+        self.upgrading_quality = false;
         let shown = carried.clone().unwrap_or_else(|| track.clone());
         self.audio.status.duration_ms.store(shown.duration.map_or(0, |d| d as u64 * 1000), Ordering::Relaxed);
         // A song running into the next crossfades (so does Next, when that's switched
         // on); going back or picking a song cuts over.
-        self.audio.send(if self.handoff && at.is_zero() { AudioCmd::Handoff } else { AudioCmd::Stop });
-        self.buffering = true;
+        self.audio.send(if self.handoff && at.is_zero() { AudioCmd::Handoff } else { AudioCmd::StopAt(at) });
+        self.play_load = Some(LoadingPlayback { at, report, quality, trying_standard: false });
         self.seek_drag = None;
         // A carried song version goes with its music video, which plays if the song won't.
         let song_of = if carried.is_none() && at.is_zero() { self.song_of(&track) } else { None };
         self.playing_as = carried.clone().map(|song| PlayingAs { generation: self.generation, listed: track.id.clone(), song });
-        self.backend.request(Req::Play { video_id: track.id.clone(), generation: self.generation, at, report, song_of, song: carried, track: Some(track.clone()) });
+        self.backend.request(Req::Play { video_id: track.id.clone(), generation: self.generation, at, report, song_of, song: carried, track: Some(track.clone()), quality });
         if mixing {
             // The outgoing song keeps the art, lyrics and media info it still deserves.
         } else {
             self.show_in_media(&shown);
-            // Background art follows the track; lyrics and segments, what plays.
-            self.request_art();
-            self.refresh_lyrics(shown);
+            self.lyrics = None;
+            self.segments = None;
+            self.lyric_view.reset();
         }
-        if let Some(m) = &mut self.media {
-            m.set_playing(true);
+    }
+
+    pub(super) fn cancel_loading(&mut self) {
+        let Some(load) = self.play_load.take() else { return };
+        self.generation += 1;
+        self.backend.set_play_generation(self.generation);
+        if let Some(song) = &mut self.playing_as {
+            song.generation = self.generation;
         }
-        self.top_up();
+        self.resume_at = Some(load.at);
+        self.resume_counts = load.report;
+        self.audio_info = None;
+        self.stream_stats = None;
+        self.upgrading_quality = false;
+        let was_mixing = self.mix_from.take().is_some();
+        self.pending_mix = None;
+        self.audio.send(AudioCmd::StopAt(load.at));
+        if was_mixing {
+            self.release_mix();
+        }
     }
 
     /// The playing track's title, artist and length for the system's media controls,
@@ -386,7 +452,7 @@ impl App {
     /// Jump over a SponsorBlock segment once playback is inside it; one that runs to the
     /// end finishes the song. A guest in a jam follows the host, who does the skipping.
     pub(super) fn skip_segments(&mut self, ctx: &egui::Context, now: f64) {
-        if !self.sponsorblock || self.jam.guest() || self.resume_at.is_some() || self.buffering || !self.playing() {
+        if !self.sponsorblock || self.jam.guest() || self.resume_at.is_some() || self.buffering() || !self.playing() {
             return;
         }
         let Some((id, segs)) = &self.segments else { return };
@@ -421,8 +487,8 @@ impl App {
 
     /// Fetch whatever plays after the current track so skipping is instant.
     pub(super) fn prefetch_next(&self) {
-        if let Some(t) = self.queue.upcoming() {
-            self.backend.request(Req::Prefetch { video_id: t.id.clone(), song_of: self.song_of(t), track: Some(t.clone()) });
+        if !self.buffering() && let Some(t) = self.queue.upcoming() {
+            self.backend.request(Req::Prefetch { video_id: t.id.clone(), generation: self.generation, song_of: self.song_of(t), track: Some(t.clone()) });
         }
     }
 
@@ -454,6 +520,8 @@ impl App {
             // Restored but not loaded yet (nothing for the player to seek): move the start point instead.
             self.resume_at = Some(at);
             self.audio.status.position_ms.store(at.as_millis() as u64, Ordering::Relaxed);
+        } else if let Some(load) = self.play_load {
+            self.play_with_quality(at, load.report, load.quality);
         } else {
             self.audio.send(AudioCmd::Seek(at));
         }
@@ -465,6 +533,10 @@ impl App {
         }
         if self.jam.guest() {
             return jam::request(self, crate::jam::Cmd::Toggle);
+        }
+        if self.buffering() && !self.audio.status.started(self.generation) {
+            self.cancel_loading();
+            return;
         }
         if let Some(at) = self.resume_at {
             // Last session's song, already counted when it started then (unless it was

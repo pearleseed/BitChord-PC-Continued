@@ -22,9 +22,21 @@ pub enum AudioCmd {
     Start { generation: u64, decoder: TrackDecoder, shared: Arc<Shared>, at: Duration },
     /// A decoder positioned at `at`, replacing the current one; only the latest seek's lands.
     Replace { generation: u64, seek: u64, decoder: TrackDecoder, at: Duration, seekable: bool },
+    SeekFailed { generation: u64, seek: u64 },
+    /// Replace a standard stream in place if its position still matches the prepared decoder.
+    Upgrade {
+        generation: u64,
+        expected: Arc<Shared>,
+        decoder: TrackDecoder,
+        shared: Arc<Shared>,
+        at: Duration,
+        accepted: tokio::sync::oneshot::Sender<bool>,
+    },
     Pause,
     Resume,
     Stop,
+    /// Stop a pending play and keep its position available for a retry.
+    StopAt(Duration),
     /// Another song is on its way: with crossfade on, fade this one out instead of
     /// stopping it, and fade the next one in when it starts.
     Handoff,
@@ -66,6 +78,7 @@ pub struct AudioStatus {
     pub playing: AtomicBool,
     /// Generation the UI most recently asked for; the engine ignores older decoders.
     pub wanted_gen: AtomicU64,
+    started_gen: AtomicU64,
     /// f32 bits
     volume: AtomicU32,
     /// Turn loud tracks down to YouTube's loudness target.
@@ -85,12 +98,17 @@ pub struct AudioStatus {
     mix_generation: AtomicU64,
     mix_duration_ms: AtomicU32,
     mix_active: AtomicBool,
+    transition_active: AtomicBool,
     outgoing_position_ms: AtomicU64,
     outgoing_sampled_at: AtomicU64,
     outgoing_playing: AtomicBool,
 }
 
 impl AudioStatus {
+    pub fn started(&self, generation: u64) -> bool {
+        self.started_gen.load(Ordering::Acquire) == generation
+    }
+
     pub fn position(&self) -> Duration {
         Duration::from_millis(self.position_ms.load(Ordering::Relaxed))
     }
@@ -143,6 +161,10 @@ impl AudioStatus {
 
     pub fn mixing(&self) -> bool {
         self.mix_active.load(Ordering::Relaxed)
+    }
+
+    pub fn transitioning(&self) -> bool {
+        self.transition_active.load(Ordering::Relaxed)
     }
 
     pub fn latency(&self) -> Duration {
@@ -596,14 +618,17 @@ fn build_seek(j: SeekJob, tx: &Sender<AudioCmd>, events: &Sender<AudioEvent>) {
         Ok((decoder, pos)) => {
             let _ = tx.send(AudioCmd::Replace { generation, seek, decoder, at: pos, seekable });
         }
-        Err(e) => match shared.error() {
-            Some(reason) => {
-                let _ = events.send(AudioEvent::Interrupted { generation, at: pos, reason });
+        Err(e) => {
+            let _ = tx.send(AudioCmd::SeekFailed { generation, seek });
+            match shared.error() {
+                Some(reason) => {
+                    let _ = events.send(AudioEvent::Interrupted { generation, at: pos, reason });
+                }
+                None => {
+                    let _ = events.send(AudioEvent::Error(format!("Seek failed: {e}")));
+                }
             }
-            None => {
-                let _ = events.send(AudioEvent::Error(format!("Seek failed: {e}")));
-            }
-        },
+        }
     }
 }
 
@@ -619,6 +644,8 @@ struct Fading {
     /// The song ended on its own rather than being skipped: this handoff gets the whole
     /// musical phrase.
     natural: bool,
+    /// A short fade between qualities of the same song, not a track transition.
+    quality_swap: bool,
 }
 
 impl Fading {
@@ -642,6 +669,11 @@ impl Drop for Fading {
 /// Fade-outs shorter than this would click: a crossfade cut short by another skip, or
 /// one too close to the end of the song.
 const QUICK_FADE_MS: u32 = 40;
+
+fn upgrade_position_matches(prepared: Duration, current: Duration) -> bool {
+    // The backend samples a position that the audio thread refreshes every 100 ms.
+    prepared.abs_diff(current) <= Duration::from_millis(150)
+}
 
 /// How long a song keeps playing at full volume for the next one to load before it
 /// fades out anyway.
@@ -732,7 +764,7 @@ impl Output {
         let id = device.id().map(|i| i.to_string()).ok();
         let lost = self.lost.clone();
         lost.store(false, Ordering::Relaxed);
-        let on_error = move |e: rodio::cpal::StreamError| {
+        let on_error = move |e: rodio::CpalError| {
             log::warn!("audio: output device error: {e}");
             if !lost.swap(true, Ordering::Relaxed) {
                 let _ = tx.send(AudioCmd::DeviceLost);
@@ -812,7 +844,7 @@ pub fn output_devices() -> Vec<OutputDevice> {
             let id = d.id().ok()?.to_string();
             let desc = d.description().ok()?;
             // "Speakers (Realtek(R) Audio)" rather than just "Speakers".
-            let name = desc.extended().first().cloned().unwrap_or_else(|| desc.name().to_owned());
+            let name = desc.extended().next().unwrap_or_else(|| desc.name()).to_owned();
             Some(OutputDevice { id, name })
         })
         .collect();
@@ -921,6 +953,8 @@ fn run(
     let mut seekable = false;
     // Latest seek; a slower, older seek's decoder must not land after a newer one.
     let mut seek_seq: u64 = 0;
+    // A seek remains pending until the audio thread applies its queued result.
+    let mut seek_pending = false;
     let seek_job: Arc<std::sync::Mutex<Option<SeekJob>>> = Default::default();
     let seek_busy = Arc::new(std::sync::atomic::AtomicBool::new(false));
     // Dev hook: YTM_DEVICE_LOST=<secs> acts as if the output device disconnected that
@@ -929,7 +963,11 @@ fn run(
     loop {
         // Poll while playing so the position stays fresh and the end is noticed; idle otherwise.
         let timeout = if (current != 0 || !fading.is_empty()) && !player.is_paused() { Duration::from_millis(100) } else { Duration::from_secs(3600) };
-        match rx.recv_timeout(timeout) {
+        let command = rx.recv_timeout(timeout);
+        if matches!(&command, Ok(AudioCmd::Handoff)) {
+            fading.retain(|f| !f.quality_swap);
+        }
+        match command {
             Ok(AudioCmd::Start { generation, decoder, shared: s, at }) => {
                 if generation != status.wanted_gen.load(Ordering::Relaxed) {
                     log::debug!("audio: dropping stale generation {generation}");
@@ -938,6 +976,11 @@ fn run(
                 log::debug!("audio: start generation {generation}");
                 if output.sink.is_none() || output.default_changed() {
                     output.open(tx.clone(), &status);
+                }
+                if let Some(old) = shared.replace(s.clone())
+                    && !Arc::ptr_eq(&old, &s)
+                {
+                    old.cancel();
                 }
                 player.clear();
                 let gain = norm_gain(&status, Some(&s));
@@ -958,6 +1001,7 @@ fn run(
                 status.bpm.store(s.tempo.get().copied().flatten().unwrap_or(0.0).to_bits(), Ordering::Relaxed);
                 status.mix_duration_ms.store(fade_in, Ordering::Relaxed);
                 status.mix_active.store(mix, Ordering::Relaxed);
+                status.transition_active.store(!fading.is_empty(), Ordering::Relaxed);
                 status.mix_generation.store(generation, Ordering::Release);
                 player.append(Meter::new(decoder, status.clone(), fade_in, fade_out.clone(), mix, s.tempo.clone()));
                 player.play();
@@ -966,21 +1010,21 @@ fn run(
                     status.duration_ms.store(s.duration_ms, Ordering::Relaxed);
                 }
                 length = status.duration();
-                if let Some(old) = shared.replace(s.clone())
-                    && !Arc::ptr_eq(&old, &s)
-                {
-                    old.cancel();
-                }
                 current = generation;
                 offset = at;
                 seekable = !at.is_zero();
+                seek_pending = false;
                 ending_sent = false;
+                status.set_position(at.as_millis() as u64);
                 status.playing.store(true, Ordering::Relaxed);
+                status.started_gen.store(generation, Ordering::Release);
+                wake();
             }
             Ok(AudioCmd::Replace { generation, seek, decoder, at, seekable: s }) => {
                 if generation != current || seek != seek_seq {
                     continue;
                 }
+                seek_pending = false;
                 log::debug!("audio: seek to {at:?} via new decoder (seekable: {s})");
                 seekable = s;
                 let paused = player.is_paused();
@@ -992,6 +1036,58 @@ fn run(
                     player.play();
                 }
                 offset = at;
+            }
+            Ok(AudioCmd::SeekFailed { generation, seek }) => {
+                if generation == current && seek == seek_seq {
+                    seek_pending = false;
+                }
+            }
+            Ok(AudioCmd::Upgrade { generation, expected, decoder, shared: s, at, accepted }) => {
+                if generation != current
+                    || generation != status.wanted_gen.load(Ordering::Relaxed)
+                    || ending_sent
+                    || player.empty()
+                    || fading.iter().any(|f| !f.player.empty())
+                    || seek_pending
+                    || !shared.as_ref().is_some_and(|old| Arc::ptr_eq(old, &expected))
+                    || !upgrade_position_matches(at, offset + player.get_pos())
+                {
+                    let _ = accepted.send(false);
+                    continue;
+                }
+                log::debug!("audio: upgraded generation {generation} at {at:?}");
+                seek_seq += 1;
+                let paused = player.is_paused();
+                let old = std::mem::replace(&mut player, Player::connect_new(&output.mixer));
+                if paused {
+                    expected.cancel();
+                    player.pause();
+                } else {
+                    fade_out.store(QUICK_FADE_MS, Ordering::Relaxed);
+                    fading.push(Fading { player: old, offset, shared: shared.take(), out: fade_out.clone(), waiting: None, natural: false, quality_swap: true });
+                }
+                let gain = norm_gain(&status, Some(&s));
+                player.set_volume(slider_gain(&status, f32::from_bits(status.volume.load(Ordering::Relaxed))) * gain);
+                fade_out = Arc::new(AtomicU32::new(0));
+                let analysis = s.tempo.clone();
+                if let Some(tempo) = expected.tempo.get() {
+                    let _ = analysis.set(*tempo);
+                }
+                status.bpm.store(analysis.get().copied().flatten().unwrap_or(0.0).to_bits(), Ordering::Relaxed);
+                player.append(Meter::new(decoder, status.clone(), if paused { 0 } else { QUICK_FADE_MS }, fade_out.clone(), false, analysis));
+                if !paused {
+                    player.play();
+                }
+                if s.duration_ms > 0 {
+                    status.duration_ms.store(s.duration_ms, Ordering::Relaxed);
+                }
+                length = status.duration();
+                shared = Some(s);
+                offset = at;
+                seekable = true;
+                status.set_position(at.as_millis() as u64);
+                let _ = accepted.send(true);
+                wake();
             }
             Ok(AudioCmd::Pause) => {
                 log::debug!("audio: pause at {:?}", offset + player.get_pos());
@@ -1027,12 +1123,12 @@ fn run(
                 let left = length.map(|d| d.saturating_sub(offset + player.get_pos()));
                 log::debug!("audio: handing off from generation {current}, {left:?} left");
                 let old = std::mem::replace(&mut player, Player::connect_new(&output.mixer));
-                fading.push(Fading { player: old, offset, shared: shared.take(), out: fade_out.clone(), waiting: Some((Instant::now(), left)), natural: ending_sent });
+                fading.push(Fading { player: old, offset, shared: shared.take(), out: fade_out.clone(), waiting: Some((Instant::now(), left)), natural: ending_sent, quality_swap: false });
                 current = 0;
                 status.playing.store(false, Ordering::Relaxed);
                 status.set_position(0);
             }
-            Ok(cmd @ (AudioCmd::Stop | AudioCmd::Handoff)) => {
+            Ok(cmd @ (AudioCmd::Stop | AudioCmd::StopAt(_) | AudioCmd::Handoff)) => {
                 if matches!(cmd, AudioCmd::Handoff) {
                     // Skipping again mid-crossfade: everything playing goes, quickly enough
                     // to sound like a cut but without a click, and the next song comes in
@@ -1045,23 +1141,33 @@ fn run(
                     if current != 0 && !player.is_paused() && !player.empty() {
                         fade_out.store(QUICK_FADE_MS, Ordering::Relaxed);
                         let old = std::mem::replace(&mut player, Player::connect_new(&output.mixer));
-                        fading.push(Fading { player: old, offset, shared: shared.take(), out: fade_out.clone(), waiting: None, natural: false });
+                        fading.push(Fading { player: old, offset, shared: shared.take(), out: fade_out.clone(), waiting: None, natural: false, quality_swap: false });
                     } else {
-                        player.clear();
+                        if let Some(old) = shared.take() {
+                            old.cancel();
+                        }
+                        player = Player::connect_new(&output.mixer);
                     }
                 } else {
-                    player.clear();
+                    // A decoder can be blocked in a read. Cancel its stream before
+                    // dropping the players so a stalled network can't hold up Stop.
+                    if let Some(old) = shared.take() {
+                        old.cancel();
+                    }
                     fading.clear();
+                    player = Player::connect_new(&output.mixer);
                 }
                 current = 0;
                 status.mix_active.store(false, Ordering::Relaxed);
+                status.transition_active.store(false, Ordering::Relaxed);
                 status.mix_generation.store(0, Ordering::Release);
-                // Also stops a seek still waiting on this download.
-                if let Some(old) = shared.take() {
-                    old.cancel();
-                }
                 status.playing.store(false, Ordering::Relaxed);
-                status.set_position(0);
+                let at = match cmd {
+                    AudioCmd::StopAt(at) => at,
+                    _ => Duration::ZERO,
+                };
+                status.set_position(at.as_millis() as u64);
+                wake();
             }
             Ok(cmd @ (AudioCmd::Seek(_) | AudioCmd::SeekLive { .. })) => {
                 let (pos, live) = match cmd {
@@ -1078,7 +1184,8 @@ fn run(
                     f.out.store(QUICK_FADE_MS, Ordering::Relaxed);
                 }
                 // A seekable decoder already indexed the (fully downloaded) file.
-                if seekable && player.try_seek(pos).is_ok() {
+                if seekable && shared.as_ref().is_some_and(|s| s.is_complete()) && player.try_seek(pos).is_ok() {
+                    seek_pending = false;
                     log::debug!("audio: seek to {pos:?} in place");
                     offset = Duration::ZERO;
                     status.set_position(pos.as_millis() as u64);
@@ -1089,6 +1196,7 @@ fn run(
                 // header, so it may wait for the download) and swap it in. Back to the
                 // start, a fresh non-seekable decoder is enough and opens at once.
                 if let Some(s) = shared.clone() {
+                    seek_pending = true;
                     // One builder at a time, always for the latest seek: a burst of seeks
                     // (a jam catching up) mustn't pile up threads waiting on the download.
                     *seek_job.lock().unwrap() = Some(SeekJob { shared: s, pos, live, generation: current, seek: seek_seq });
@@ -1173,6 +1281,7 @@ fn run(
             fading.retain(|f| !f.player.empty());
             if fading.is_empty() {
                 status.mix_active.store(false, Ordering::Relaxed);
+                status.transition_active.store(false, Ordering::Relaxed);
                 wake();
                 log::debug!("audio: crossfade done");
             }

@@ -88,6 +88,7 @@ impl App {
                 MediaControlEvent::Play | MediaControlEvent::Pause if self.jam.guest() => self.toggle(),
                 MediaControlEvent::Play if self.resume_at.is_some() => self.toggle(),
                 MediaControlEvent::Play => self.audio.send(AudioCmd::Resume),
+                MediaControlEvent::Pause | MediaControlEvent::Stop if self.buffering() && !self.audio.status.started(self.generation) => self.cancel_loading(),
                 MediaControlEvent::Pause | MediaControlEvent::Stop => self.audio.send(AudioCmd::Pause),
                 MediaControlEvent::Toggle => self.toggle(),
                 MediaControlEvent::Next => self.next(),
@@ -95,10 +96,17 @@ impl App {
                 _ => {}
             }
         }
-        if self.buffering && self.playing() {
-            self.buffering = false;
+        if self.buffering() && self.audio.status.started(self.generation) {
+            self.play_load = None;
             self.skip_streak = 0;
             self.prefetch_next();
+            if self.mix_hold().is_none() {
+                self.request_art();
+                if let Some(shown) = self.playing_as().cloned().or_else(|| self.current().cloned()) {
+                    self.refresh_lyrics(shown);
+                }
+            }
+            self.top_up();
             // Dev hook: YTM_SEEK=<secs> jumps into the first track once it starts.
             if self.generation == 1 {
                 if let Some(s) = std::env::var("YTM_SEEK").ok().and_then(|v| v.parse::<f32>().ok()) {
@@ -259,6 +267,9 @@ impl App {
                 if l.albums_failed {
                     l.albums = self.library.as_ref().map(|o| o.albums.clone()).unwrap_or_default();
                 }
+                if l.podcasts_failed {
+                    l.podcasts = self.library.as_ref().map(|o| o.podcasts.clone()).unwrap_or_default();
+                }
                 self.library = Some(l);
                 self.loading = false;
             }
@@ -364,10 +375,10 @@ impl App {
             Resp::Radio { seed, tracks } => {
                 self.radio_pending = false;
                 let was_at_end = self.queue.add_radio(&seed, tracks);
-                if was_at_end && self.queue.index.is_some() && !self.buffering && !self.playing() {
+                if was_at_end && self.queue.index.is_some() && self.resume_at.is_none() && !self.buffering() && !self.playing() {
                     // The track ended while radio was loading: continue now.
                     self.next();
-                } else if !self.buffering {
+                } else if !self.buffering() {
                     self.prefetch_next();
                 }
             }
@@ -454,7 +465,9 @@ impl App {
                     };
                     if self.mix_hold().is_none() {
                         self.show_in_media(&shown);
-                        self.refresh_lyrics(shown);
+                        if !self.buffering() {
+                            self.refresh_lyrics(shown);
+                        }
                     }
                     // A jam began while it was being looked up: everyone plays the host's upload.
                     if self.jam.active() {
@@ -463,10 +476,27 @@ impl App {
                 }
             }
             Resp::PlayError { generation, msg } => self.on_play_error(generation, msg),
+            Resp::TryingStandard { generation } if generation == self.generation => {
+                if let Some(load) = &mut self.play_load {
+                    load.trying_standard = true;
+                }
+            }
+            Resp::TryingStandard { .. } => {}
             Resp::AudioInfo { generation, info } => {
                 // The stream that answered may already have been skipped past.
                 if generation == self.generation {
                     self.audio_info = Some((generation, info));
+                    self.upgrading_quality = false;
+                }
+            }
+            Resp::UpgradingQuality { generation, active } => {
+                if generation == self.generation {
+                    self.upgrading_quality = active;
+                }
+            }
+            Resp::StreamStats { generation, stats } => {
+                if generation == self.generation {
+                    self.stream_stats = Some((generation, stats));
                 }
             }
             Resp::ServerQueue(q) => self.adopt_server_queue(q),
@@ -581,7 +611,10 @@ impl App {
     /// A song couldn't play: skip it, or stop when skipping can't help.
     fn on_play_error(&mut self, generation: u64, msg: String) {
         if generation == self.generation {
-            self.buffering = false;
+            if let Some(load) = self.play_load.take() {
+                self.resume_at = Some(load.at);
+                self.resume_counts = load.report;
+            }
             if self.mix_from.take().is_some() {
                 self.pending_mix = None;
                 self.audio.send(AudioCmd::Stop);

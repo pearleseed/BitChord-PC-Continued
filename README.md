@@ -73,12 +73,12 @@ If Windows SmartScreen appears for an unsigned build, choose **More info → Run
 
 ## Building from source
 
-You need the [Rust toolchain](https://rustup.rs/).
+You need [Rust](https://rustup.rs/) 1.95 or newer.
 
 ```sh
 git clone https://github.com/jackychan4891/BitChord-PC-Continued.git
 cd BitChord-PC-Continued
-cargo build --release
+cargo build --release --locked
 ```
 
 The built app will be in `target/release/`.

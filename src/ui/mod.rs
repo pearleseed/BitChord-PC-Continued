@@ -75,6 +75,7 @@ pub enum LibTab {
     Playlists,
     Songs,
     Albums,
+    Podcasts,
     History,
     Uploads,
 }
@@ -117,7 +118,6 @@ pub enum Action {
     Collaborate,
     DeletePlaylist,
     SaveCollection(String, bool),
-    HomeChip(Option<String>),
     OpenNowPlaying(bool),
     /// Into the mini player (true) or back to the full window.
     Mini(bool),
@@ -127,6 +127,8 @@ pub enum Action {
     RevertQuality,
     /// Clear a quality revert and replay, asking hi-res sources again.
     UpgradeQuality,
+    /// Skip the hi-res lookup for the current load.
+    PlayStandardNow,
     /// A song chosen on the search page as the Spotify transfer's match.
     TransferPick(Track),
 }
@@ -350,7 +352,7 @@ pub struct App {
     // playback
     queue: Queue,
     generation: u64,
-    buffering: bool,
+    play_load: Option<playback::LoadingPlayback>,
     /// Unplayable songs skipped in a row; a run of them stops playback instead of
     /// racing through the queue.
     skip_streak: u32,
@@ -409,6 +411,11 @@ pub struct App {
     /// What the playing stream is (codec, rate, depth, size), when a hi-res source
     /// supplied it, with the generation it belongs to.
     audio_info: Option<(u64, crate::hires::Info)>,
+    upgrading_quality: bool,
+    /// Stats for nerds: the playing stream's codec, rate and bitrate on the cover.
+    show_nerd_stats: bool,
+    /// What the decoder is being fed, whatever the source, with its generation.
+    stream_stats: Option<(u64, crate::stream::Stats)>,
     accent: Color32,
     /// Selected theme preset (see `preset.rs`).
     theme_id: String,
@@ -655,7 +662,7 @@ impl App {
                 _ => Repeat::Off,
             }),
             generation: 0,
-            buffering: false,
+            play_load: None,
             skip_streak: 0,
             recoveries: 0,
             autoplay: get("autoplay").is_none_or(|v| v == "1"),
@@ -718,6 +725,9 @@ impl App {
             hires_focus: false,
             prefer_atmos,
             audio_info: None,
+            upgrading_quality: false,
+            show_nerd_stats: get("show_nerd_stats").is_some_and(|v| v == "1"),
+            stream_stats: None,
             art_changed: -10.0,
             accent: theme::RED,
             theme_id: crate::preset::DEFAULT_ID.to_owned(),
@@ -792,6 +802,7 @@ impl App {
             Ok("new") | Ok("explore") => app.go(Page::New),
             Ok("library") => app.go(Page::Library(LibTab::Playlists)),
             Ok("uploads") => app.go(Page::Library(LibTab::Uploads)),
+            Ok("podcasts") => app.go(Page::Library(LibTab::Podcasts)),
             Ok("liked") => app.go(Page::Library(LibTab::Songs)),
             Ok("history") => app.go(Page::Library(LibTab::History)),
             Ok("settings") => app.go(Page::Settings),
@@ -1101,7 +1112,7 @@ impl eframe::App for App {
         self.pump(now);
         self.skip_segments(ctx, now);
         // System media controls and taskbar buttons follow the player however it changed.
-        let playing = self.playing() || self.buffering;
+        let playing = self.playing();
         if let Some(m) = &mut self.media {
             m.set_playing(playing);
         }
@@ -1171,7 +1182,7 @@ impl eframe::App for App {
         let np = widgets::NowPlaying {
             song: self.current_id().map(str::to_owned),
             source: self.queue_source.clone(),
-            playing: self.playing() || self.buffering,
+            playing: self.playing() || self.buffering(),
         };
         ctx.data_mut(|d| d.insert_temp(widgets::NowPlaying::id(), np));
         if let Some((_, t)) = &mut self.toast {
@@ -1189,7 +1200,7 @@ impl eframe::App for App {
         let playing = self.playing();
         if self.window_hidden {
             // In the tray or minimized: nothing to draw, only the player bookkeeping.
-            if playing || self.buffering {
+            if playing || self.buffering() {
                 ctx.request_repaint_after(Duration::from_millis(250));
             }
         } else if self.np_open && playing && !self.mini.busy() {
@@ -1199,7 +1210,7 @@ impl eframe::App for App {
             ctx.request_repaint_after(Duration::from_millis(16));
         } else if playing && self.anim_bg && shell::pages_bg_moves(self.look()) {
             ctx.request_repaint_after(Duration::from_millis(66));
-        } else if playing || self.buffering {
+        } else if playing || self.buffering() {
             ctx.request_repaint_after(Duration::from_millis(250));
         }
     }
@@ -1304,7 +1315,7 @@ impl eframe::App for App {
             // The player: a frosted strip over the bottom of the main section, above the
             // pages, so their last rows fade under it instead of stopping at a seam.
             let strip = egui::Rect::from_min_max(egui::pos2(section.left(), screen.bottom() - self.bar_height()), egui::pos2(main_right, screen.bottom()));
-            egui::Area::new(egui::Id::new("player-bar"))
+            egui::Area::new(egui::Id::unique("player-bar"))
                 .fixed_pos(strip.min)
                 .order(egui::Order::Middle)
                 .show(&ctx, |ui| {
@@ -1449,6 +1460,7 @@ impl eframe::App for App {
         storage.set_string("signature_api", self.signature_api.clone());
         storage.set_string("hires_source", self.hires_sources.join("\n"));
         storage.set_string("prefer_atmos", b(self.prefer_atmos));
+        storage.set_string("show_nerd_stats", b(self.show_nerd_stats));
         storage.set_string("sponsorblock", b(self.sponsorblock));
         storage.set_string("crossfade", b(self.crossfade));
         storage.set_string("automix", b(self.automix));
