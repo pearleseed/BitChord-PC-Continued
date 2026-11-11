@@ -1,113 +1,61 @@
-<div align="center">
-  <h1>BitChord</h1>
-  <p><strong>A fast, native YouTube Music desktop app — rebuilt in Rust.</strong></p>
-  <p>Built with egui and rodio. No Electron, no embedded browser player, and light on memory while playing.</p>
+# BitChord
 
-  <p>
-    <a href="https://github.com/pearleseed/BitChord-PC-Continued/releases/latest"><img src="https://img.shields.io/github/v/release/pearleseed/BitChord-PC-Continued?style=flat-square&color=a855f7&labelColor=0d1117" alt="Latest release"></a>
-    <a href="https://github.com/pearleseed/BitChord-PC-Continued/releases"><img src="https://img.shields.io/github/downloads/pearleseed/BitChord-PC-Continued/total?style=flat-square&color=a855f7&labelColor=0d1117" alt="Downloads"></a>
-    <img src="https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-333?style=flat-square&labelColor=0d1117" alt="Platforms">
-    <a href="LICENSE"><img src="https://img.shields.io/github/license/pearleseed/BitChord-PC-Continued?style=flat-square&color=333&labelColor=0d1117" alt="License: GPL-3.0"></a>
-  </p>
+Native YouTube Music desktop client written in Rust, with egui/eframe for the
+interface and rodio/Symphonia for audio playback. Supports Windows, macOS and Linux.
 
-  <p>
-    <a href="https://discord.gg/cWQSGjpXM">Discord</a> ·
-    <a href="https://github.com/pearleseed/BitChord-PC-Continued/releases/latest">Download</a> ·
-    <a href="#features">Features</a> ·
-    <a href="#installation">Installation</a> ·
-    <a href="#building-from-source">Build from source</a>
-  </p>
-</div>
+Playback includes offline downloads, synced lyrics, themes, Spotify playlist
+transfer, Last.fm, Discord Rich Presence and shared listening through the Jam relay.
+Hi-res playback uses the addon sources configured by the listener.
 
-> BitChord is an independent, unofficial client. It is not affiliated with, endorsed by, or connected to YouTube, Google, or Apple.
+## Build and run
 
-## Screenshots
-
-<table>
-  <tr>
-    <td width="50%"><img src="docs/readme/screenshot-1.png" alt="Full player with artwork, lyrics and controls"></td>
-    <td width="50%"><img src="docs/readme/screenshot-2.png" alt="Browse view with shelves and playback controls"></td>
-  </tr>
-  <tr>
-    <td align="center"><b>Player</b> — artwork, lyrics, queue and playback in one view</td>
-    <td align="center"><b>Browse</b> — your music, shelves and navigation</td>
-  </tr>
-  <tr>
-    <td colspan="2"><img src="docs/readme/screenshot-3.png" alt="BitChord interface and playback" width="100%"></td>
-  </tr>
-  <tr>
-    <td colspan="2" align="center"><b>Desktop experience</b> — native UI, fast playback, and quality controls</td>
-  </tr>
-</table>
-
-## Features
-
-**Playback**
-- **YouTube Music, natively** — search, browse, albums, playlists, artist pages, radio, mixes, charts and your library.
-- **Lossless / Hi-Res Lossless / Dolby Atmos** — play higher-quality copies from configured hi-res addon sources when a matching copy is available, with YouTube audio as the fallback.
-- **Quality controls in the player** — see the active audio quality, prefer Dolby Atmos when available, and revert or upgrade quality from the player menu.
-- **Automix and crossfade** — DJ-style transitions between songs, with a mixing state shown in the player during transitions.
-- **Queue and playback controls** — shuffle, repeat, autoplay, song radio, next-track prefetch, volume normalization, and output device selection.
-- **Downloads** — save songs for offline playback.
-
-**Lyrics and interface**
-- **Synced lyrics** — timed lyrics with provider fallbacks, timing controls, romanization and translation options.
-- **Native Rust desktop UI** — a fast egui/rodio interface with system media controls, tray integration, and keyboard-friendly navigation.
-- **Discord Rich Presence** — show what you’re listening to on Discord.
-- **Last.fm scrobbling** — connect your Last.fm account in Settings.
-
-**Accounts and library**
-- **Google sign-in** — unlock your YouTube Music feed, likes, playlists, history and recommendations.
-- **Library and uploads** — access saved music and uploaded tracks where available.
-- **Listen Together / jams** — start or join a shared listening session.
-- **Spotify transfer** — bring playlists and liked music over from Spotify.
-
-## Installation
-
-Download the latest build from [Releases](https://github.com/pearleseed/BitChord-PC-Continued/releases/latest).
-
-- **Windows** — download the Windows release asset, extract/install it, and run `bitchord.exe`.
-- **macOS / Linux** — use the platform release assets when available.
-
-If Windows SmartScreen appears for an unsigned build, choose **More info → Run anyway**.
-
-## Building from source
-
-You need [Rust](https://rustup.rs/) 1.95 or newer. On macOS, install the Xcode command-line tools for the AppKit bridge and bundle tooling.
+Requires Rust 1.95 or newer and the platform's native development libraries.
+On macOS, install the Xcode command-line tools. The
+[CI workflow](.github/workflows/check.yml) lists the required Linux development packages.
 
 ```sh
-git clone https://github.com/pearleseed/BitChord-PC-Continued.git
-cd BitChord-PC-Continued
+cargo run --locked
 cargo test --locked
 cargo build --release --locked
 ```
 
-The executable is `target/release/bitchord` (`bitchord.exe` on Windows). To build a macOS app bundle, pass the current Cargo package version:
+The executable is `target/release/bitchord` (`bitchord.exe` on Windows).
+Cargo embeds the required fonts, icons, theme data and YouTube solver scripts;
+there is no need to copy `assets/` beside the executable.
 
-```sh
-macos/bundle.sh target/release/bitchord 2.0.0 dist
-open dist/bitchord.app
+Last.fm credentials can be supplied through `LASTFM_API_KEY` and `LASTFM_SECRET`
+at build time or runtime. Without them, the app shows Last.fm as unconfigured.
+
+## Project layout
+
+```text
+Cargo.toml / Cargo.lock  Desktop package and locked dependencies
+build.rs                Windows resources and macOS native bridge compilation
+src/main.rs             Desktop application entry point
+src/                    Application modules and UI
+src/native/macos/       Objective-C bridges used by the Rust application
+assets/                 Embedded application resources and font licenses
+server/                 Standalone Rust Jam relay and smoke client
+vendor/block/           Compatibility patch required by souvlaki on macOS
+.github/workflows/      Build and test checks
 ```
 
-See the [development guide](docs/development.md) for the architecture, platform dependencies, signing, service configuration, and the modernization audit.
+The Jam relay is an independent Cargo project. See its [README](server/README.md)
+for development and deployment instructions.
 
 ## Notes
 
-- Audio and the main interface are native (Rust + egui + rodio). Sign-in and some web flows may open a system webview window.
-- Hi-res/Lossless/Atmos playback depends on configured addon sources and whether a matching, playable copy exists for the selected track.
-- BitChord does not bypass subscriptions, DRM, or regional restrictions. Availability depends on the services and sources you use.
-- Third-party services (YouTube Music, lyrics providers, Discord, Last.fm, Spotify, addon sources) can change behavior over time.
+BitChord is an independent, unofficial client, unaffiliated with YouTube, Google
+or Apple. Playback availability depends on the upstream services and configured
+sources. Sign-in and verification flows use a system webview.
 
-## Contributing
-
-Bug reports and pull requests are welcome. Please open an issue with clear reproduction steps, platform details, and relevant logs (with secrets/tokens removed).
+Existing release downloads are available on
+[GitHub Releases](https://github.com/pearleseed/BitChord-PC-Continued/releases).
+This repository builds the application directly with Cargo; website and installer
+packaging sources have been removed.
 
 ## License
 
-BitChord is licensed under [GPL-3.0](LICENSE).
-
-## Acknowledgements
-
-- [egui](https://github.com/emilk/egui) for the interface.
-- [rodio](https://github.com/RustAudio/rodio) and Symphonia for audio playback and decoding.
-- Lyrics, metadata, playback, and integrations depend on the upstream libraries and third-party services used by this project.
+[GPL-3.0](LICENSE). Bundled fonts retain their license files in `assets/fonts/`.
+The interface, playback and integrations use egui, rodio, Symphonia and the other
+libraries declared in `Cargo.toml`.

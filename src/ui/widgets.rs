@@ -1050,29 +1050,6 @@ pub fn paint_remote(ui: &Ui, url: &str, rect: Rect, radius: f32, uv: Rect, tint:
     }
 }
 
-/// The newest decoded frame of a motion sleeve, uploaded by the player.
-pub struct MotionSprite {
-    pub id: egui::TextureId,
-    pub size: Vec2,
-}
-
-/// Paint a motion frame into `rect`, centre-cropped like the still sleeve it replaces.
-pub fn paint_motion(ui: &Ui, rect: Rect, radius: f32, s: &MotionSprite) {
-    if !ui.is_rect_visible(rect) || rect.width() <= 0.0 || rect.height() <= 0.0 {
-        return;
-    }
-    let tex_aspect = s.size.x / s.size.y;
-    let rect_aspect = rect.width() / rect.height();
-    let uv = if rect_aspect > tex_aspect {
-        Rect::from_center_size(pos2(0.5, 0.5), vec2(1.0, tex_aspect / rect_aspect))
-    } else {
-        Rect::from_center_size(pos2(0.5, 0.5), vec2(rect_aspect / tex_aspect, 1.0))
-    };
-    let shape = egui::epaint::RectShape::filled(rect, CornerRadius::same(radius as u8), Color32::WHITE)
-        .with_texture(s.id, uv);
-    ui.painter().add(shape);
-}
-
 /// Song rows still on their way, at the end of a list that's coming in.
 pub fn skeleton_rows(ui: &mut Ui, time: f64, rows: usize) {
     for _ in 0..rows {

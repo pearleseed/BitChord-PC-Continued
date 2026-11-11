@@ -613,14 +613,6 @@ fn collection(app: &mut App, ui: &mut Ui, id: &str, now: f64) {
         return;
     }
     let rows = Rows::new(app, now);
-    // The header's motion sleeve, asked for before the release is borrowed below.
-    let (release, artist) = match app.opened(id) {
-        Some(o) => (o.c.title.clone(), o.c.artists.first().map(|a| a.name.clone()).unwrap_or_else(|| o.c.byline())),
-        None => (String::new(), String::new()),
-    };
-    app.apple_cover(&release, &artist, None);
-    let px = (232.0 * ui.ctx().pixels_per_point()).round().max(256.0) as u32;
-    let sprite = app.apple_sprite(ui.ctx(), &release, &artist, px);
     let Some(o) = app.lists.get(id) else { return };
     let (c, more) = (&o.c, app.receiving(id));
     let acts = &mut app.actions;
@@ -636,9 +628,6 @@ fn collection(app: &mut App, ui: &mut Ui, id: &str, now: f64) {
         let (img, _) = ui.allocate_exact_size(Vec2::splat(232.0), Sense::hover());
         widgets::soft_shadow(ui, img, 10.0, 40.0, 0.5);
         paint_cover(ui, img, &c.thumbs, theme::card_radius() + 2.0, 1.0);
-        if let Some(s) = &sprite {
-            widgets::paint_motion(ui, img, theme::card_radius() + 2.0, s);
-        }
         ui.add_space(26.0);
         ui.vertical(|ui| {
             ui.set_max_width(ui.available_width().min(760.0));
@@ -815,9 +804,8 @@ fn artist(app: &mut App, ui: &mut Ui, id: &str, now: f64) {
     }
     let rows = Rows::new(app, now);
     let accent = app.accent_color();
-    // Apple's own page for this artist: their display name and the hero clip. Artists
-    // Apple has no clip for (Charli xcx) keep the still banner.
-    let apple = app.apple_artists.get(id).and_then(|o| o.clone());
+    // Apple's own page supplies the artist's display name and wordmark.
+    let apple = app.apple_artists.get(id).cloned();
     let name = apple.as_ref().map(|x| x.name.clone()).unwrap_or_else(|| app.artist.as_ref().map(|a| a.name.clone()).unwrap_or_default());
     // Apple's search misses once now and then. While the page is open, ask again after
     // the cooldown rather than waiting for the listener to come back to it.

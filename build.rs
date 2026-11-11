@@ -9,13 +9,16 @@ fn main() {
             .expect("failed to embed Windows icon");
     }
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
-        println!("cargo:rerun-if-changed=macos/window_chrome.m");
-        println!("cargo:rerun-if-changed=macos/lock_screen.m");
+        println!("cargo:rerun-if-changed=src/native/macos/window_chrome.m");
+        println!("cargo:rerun-if-changed=src/native/macos/lock_screen.m");
         println!("cargo:rustc-link-lib=framework=AppKit");
         println!("cargo:rustc-link-lib=framework=CoreGraphics");
         println!("cargo:rustc-link-lib=framework=CoreText");
         cc::Build::new()
-            .files(["macos/window_chrome.m", "macos/lock_screen.m"])
+            .files([
+                "src/native/macos/window_chrome.m",
+                "src/native/macos/lock_screen.m",
+            ])
             .flag("-fobjc-arc")
             .compile("bitchord_window_chrome");
     }

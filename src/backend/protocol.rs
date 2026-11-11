@@ -83,17 +83,10 @@ pub enum Req {
         key: String,
         url: String,
     },
-    /// Apple's artist page (display name and hero clips) for the artist `id`.
+    /// Apple's artist page (display name and wordmark) for the artist `id`.
     AppleArtist {
         id: String,
         name: String,
-    },
-    /// Apple's motion sleeve for a release; `key` is what the UI asked for.
-    AppleCover {
-        key: String,
-        album: String,
-        artist: String,
-        title: Option<String>,
     },
     /// A handwritten signature for `name` from the service at `endpoint`; `key` is
     /// what the UI asked for.
@@ -205,7 +198,6 @@ impl Req {
             Req::LyricsExtras { .. } => "Translation",
             Req::Art { .. } => "Art",
             Req::AppleArtist { .. } => "Apple artist",
-            Req::AppleCover { .. } => "Apple artwork",
             Req::ArtistSignature { .. } => "Artist signature",
             Req::Radio { .. } => "Loading radio",
             Req::PlayCollection { .. } => "Playback",
@@ -236,7 +228,6 @@ impl Req {
                 | Req::ServerQueue
                 | Req::Art { .. }
                 | Req::AppleArtist { .. }
-                | Req::AppleCover { .. }
                 | Req::ArtistSignature { .. }
                 | Req::Prefetch { .. }
                 | Req::HomeMore(_)
@@ -417,11 +408,6 @@ pub enum Resp {
     AppleArtist {
         id: String,
         info: Option<crate::apple::Artwork>,
-    },
-    /// Apple's motion sleeve for a release; `key` is what the UI asked it for.
-    AppleCover {
-        key: String,
-        motion: Option<crate::apple::Motion>,
     },
     /// A signature for an artist, already whitened for the header.
     ArtistSignature {

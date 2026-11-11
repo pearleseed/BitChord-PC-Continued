@@ -42,7 +42,7 @@ impl Client {
     pub async fn extras(&self, cache_key: &str, lines: &[String], lang: Option<&str>, target: &str) -> Option<Extras> {
         let file = self.dir.join(format!("{}.json", safe_name(&format!("{cache_key}_{target}"))));
         if let Some(e) = std::fs::read(&file).ok().and_then(|b| serde_json::from_slice::<Extras>(&b).ok())
-            && e.roman.len() == lines.len()
+            && e.roman.len() == lines.len() && e.trans.len() == lines.len()
         {
             return Some(e);
         }
@@ -176,20 +176,23 @@ impl Client {
     async fn translate(&self, lines: &[&str], target: &str) -> anyhow::Result<Vec<Option<String>>> {
         let v = self.call(&[("sl", "auto"), ("tl", target), ("dt", "t")], &lines.join(BATCH_SEPARATOR)).await?;
         let text: String = v[0].as_array().into_iter().flatten().filter_map(|s| s[0].as_str()).collect();
-        let mut out: Vec<String> = text.split(BATCH_SEPARATOR).map(str::to_owned).collect();
-        if out.len() < lines.len() {
-            let semi: Vec<String> = text.split(';').filter(|l| !l.trim().is_empty()).map(str::to_owned).collect();
-            let nl: Vec<String> = text.lines().filter(|l| !l.trim().is_empty()).map(str::to_owned).collect();
-            if semi.len() == lines.len() {
-                out = semi;
-            } else if nl.len() == lines.len() {
-                out = nl;
-            } else if out.len() == 1 && lines.len() > 1 {
-                anyhow::bail!("translation failed to split: expected {}, got 1", lines.len());
-            }
-        }
-        Ok((0..lines.len()).map(|i| out.get(i).map(|s| s.trim().to_owned()).filter(|s| !s.is_empty())).collect())
+        split_translation(&text, lines.len())
     }
+}
+
+fn split_translation(text: &str, count: usize) -> anyhow::Result<Vec<Option<String>>> {
+    let mut out: Vec<String> = text.split(BATCH_SEPARATOR).map(str::to_owned).collect();
+    if out.len() == 1 && count > 1 {
+        let semi: Vec<String> = text.split(';').filter(|l| !l.trim().is_empty()).map(str::to_owned).collect();
+        let nl: Vec<String> = text.lines().filter(|l| !l.trim().is_empty()).map(str::to_owned).collect();
+        if semi.len() == count {
+            out = semi;
+        } else if nl.len() == count {
+            out = nl;
+        }
+    }
+    anyhow::ensure!(out.len() == count, "translation split into {} parts, expected {}", out.len(), count);
+    Ok(out.into_iter().map(|s| Some(s.trim().to_owned()).filter(|s| !s.is_empty())).collect())
 }
 
 fn safe_name(s: &str) -> String {
@@ -255,4 +258,38 @@ pub fn script_language(s: &str) -> Option<&'static str> {
 /// Whether a line has letters outside the Latin script (kana, hangul, Cyrillic, ...).
 pub fn non_latin(s: &str) -> bool {
     s.chars().any(|c| c.is_alphabetic() && !matches!(c as u32, 0..=0x024F | 0x1E00..=0x1EFF | 0x2C60..=0x2C7F | 0xA720..=0xA7FF | 0xFF21..=0xFF5A))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn translation_rejects_missing_batch_parts() {
+        assert!(split_translation("first\n\n;\n\nsecond", 3).is_err());
+    }
+
+    #[test]
+    fn translation_rejects_extra_batch_parts() {
+        assert!(split_translation("first\n\n;\n\nsecond\n\n;\n\nthird\n\n;\n\nfourth", 3).is_err());
+    }
+
+    #[test]
+    fn translation_preserves_supported_exact_splits() {
+        let expected = vec![Some("first".to_owned()), Some("second".to_owned()), Some("third".to_owned())];
+        for text in [" first\n\n;\n\nsecond\n\n;\n\nthird ", "first; second; third", "first\nsecond\nthird"] {
+            assert_eq!(split_translation(text, 3).unwrap(), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn translation_ignores_cache_with_misaligned_translations() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = Client::new(reqwest::Client::new(), dir.path());
+        std::fs::create_dir_all(&client.dir).unwrap();
+        std::fs::write(client.dir.join("song_en.json"), br#"{"roman":[null,null,null],"trans":["wrong","line"]}"#).unwrap();
+        // Empty source lines need no network call when the invalid cache is rejected.
+        let lines = vec![String::new(); 3];
+        assert!(client.extras("song", &lines, Some("en"), "en").await.is_none());
+    }
 }

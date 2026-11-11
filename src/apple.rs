@@ -1,10 +1,9 @@
-//! Apple Music's public web data: motion artwork and artist-page hero clips.
+//! Apple Music's public web data: artist names and wordmarks.
 //!
 //! Nothing here is authenticated on the user's behalf. The catalog API wants a
 //! bearer token even for anonymous reads, and the one the web player mints for
 //! visitors is scraped from its own JS bundle, kept in memory and never logged.
-//! Searches are scored rather than trusted: a plausible-looking wrong album is
-//! worse than none, so a hit has to match the artist and the title to be used.
+//! Artist searches prefer exact names, retaining Apple's result order on ties.
 
 use std::collections::HashSet;
 use std::sync::{LazyLock, Mutex};
@@ -17,12 +16,6 @@ const AMP: &str = "https://amp-api.music.apple.com/v1/catalog";
 const STOREFRONT: &str = "us";
 const WEB_PLAYER: &str = "https://music.apple.com/us/browse";
 const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0 Safari/537.36";
-
-/// Square motion artwork for a release's sleeve.
-#[derive(Clone, Debug, Default)]
-pub struct Motion {
-    pub square: Option<String>,
-}
 
 /// Apple's own page for an artist: their display name and wordmark.
 #[derive(Clone, Debug, Default)]
@@ -55,7 +48,6 @@ impl LogoSrc {
 
 const TOKEN_TTL_MARGIN: i64 = 300;
 const TOKEN_RETRY: Duration = Duration::from_secs(30 * 60);
-const MIN_SCORE: i32 = 12;
 
 struct Token {
     jwt: String,
@@ -238,152 +230,7 @@ fn norm(s: &str) -> String {
     s.to_lowercase().chars().filter(|c| c.is_alphanumeric()).collect()
 }
 
-fn artists_match(want: &str, got: &str) -> bool {
-    let g = norm(got);
-    let parts: Vec<String> = want.split(',').map(norm).filter(|p| p.len() > 1).collect();
-    !parts.is_empty() && parts.iter().all(|p| g.contains(p.as_str()))
-}
-
-const EDITION_WORDS: [&str; 8] = ["deluxe", "expanded", "remastered", "remix", "version", "edit", "mix", "bonus"];
-const COMPILATION_MARKERS: [&str; 8] = ["playlist", "set list", "essentials", "dj mix", "mixed", "apple music", "today's hits", "session"];
-
-fn is_compilation(name: &str) -> bool {
-    let lower = name.to_lowercase();
-    COMPILATION_MARKERS.iter().any(|m| lower.contains(m))
-}
-
-/// How well a catalog hit lines up with what's asked for, or `None` to reject
-/// it outright: the artist is a gate, the title and album decide the score.
-fn score(title: &str, artist: &str, album: Option<&str>, hit: &Value, album_is_self: bool) -> Option<i32> {
-    let a = hit.get("attributes")?;
-    let name = a.get("name")?.as_str().unwrap_or_default();
-    let hit_artist = a.get("artistName")?.as_str().unwrap_or_default();
-    let hit_album = if album_is_self { name } else { a.get("albumName").and_then(Value::as_str).unwrap_or_default() };
-    if is_compilation(name) || is_compilation(hit_album) {
-        return None;
-    }
-    if !artists_match(artist, hit_artist) {
-        return None;
-    }
-    let (nt, nh) = (norm(title), norm(name));
-    if nt.is_empty() || nh.is_empty() {
-        return None;
-    }
-    let mut s = 10;
-    s += if nh == nt {
-        15
-    } else if nh.contains(&nt) || nt.contains(&nh) {
-        7
-    } else {
-        -10
-    };
-    if let Some(al) = album.filter(|a| !a.is_empty())
-        && !hit_album.is_empty()
-    {
-        let (na, nha) = (norm(al), norm(hit_album));
-        s += if na == nha {
-            20
-        } else if !na.is_empty() && (nha.contains(&na) || na.contains(&nha)) {
-            10
-        } else {
-            0
-        };
-    }
-    for w in EDITION_WORDS {
-        let in_want = title.to_lowercase().contains(w);
-        let in_hit = name.to_lowercase().contains(w);
-        if in_want && in_hit {
-            s += 4;
-        } else if in_hit {
-            s -= 3;
-        }
-    }
-    Some(s)
-}
-
-fn best<'a>(hits: &'a [Value], title: &str, artist: &str, album: Option<&str>, album_is_self: bool) -> Option<(i32, &'a Value)> {
-    hits.iter()
-        .filter_map(|h| score(title, artist, album, h, album_is_self).map(|s| (s, h)))
-        .max_by_key(|(s, _)| *s)
-        .filter(|(s, _)| *s >= MIN_SCORE)
-}
-
-fn motion_urls(video: &Value) -> Motion {
-    let link = |key: &str| -> Option<String> {
-        let asset = video.get(key)?;
-        ["video", "videoUrl", "hlsUrl", "url"]
-            .iter()
-            .find_map(|k| asset.get(*k).and_then(Value::as_str))
-            .filter(|u| !u.is_empty())
-            .map(str::to_owned)
-    };
-    let square = link("motionDetailSquare").or_else(|| link("motionSquareVideo1x1")).or_else(|| link("motionDetailRaw"));
-    Motion { square }
-}
-
-fn album_id(hit: &Value) -> Option<String> {
-    let from_rel = hit
-        .get("relationships")?
-        .get("albums")?
-        .get("data")?
-        .as_array()?
-        .first()?
-        .get("id")?
-        .as_str()
-        .map(str::to_owned);
-    if let Some(id) = from_rel.filter(|id| !id.starts_with("pl.")) {
-        return Some(id);
-    }
-    let url = hit.get("attributes")?.get("url")?.as_str()?;
-    let tail = url.split("/album/").nth(1)?.split('?').next()?;
-    tail.rsplit('/').next().filter(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit())).map(str::to_owned)
-}
-
-// -------------------------------------------------------------- lookups
-
-/// Motion artwork for a song: the sleeve clip of the album it's on.
-pub async fn song_motion(http: &reqwest::Client, title: &str, artist: &str, album: Option<&str>) -> Option<Motion> {
-    let term = match album.filter(|a| !a.is_empty() && !title.to_lowercase().contains(&a.to_lowercase())) {
-        Some(a) => format!("{artist} {title} {a}"),
-        None => format!("{artist} {title}"),
-    };
-    let q = format!(
-        "search?term={}&types=songs&limit=10&extend=editorialVideo&include=albums",
-        url_escape(&term)
-    );
-    let v = api(http, &q).await?;
-    let hits = v.pointer("/results/songs/data")?.as_array()?;
-    let (_, hit) = best(hits, title, artist, album, false)?;
-    if let Some(m) = hit.pointer("/attributes/editorialVideo").map(motion_urls)
-        && m.square.is_some()
-    {
-        return Some(m);
-    }
-    let id = album_id(hit)?;
-    album_by_id(http, &id).await
-}
-
-/// Motion artwork for a release, by its own name.
-pub async fn album_motion(http: &reqwest::Client, album: &str, artist: &str) -> Option<Motion> {
-    let term = if album.to_lowercase().contains(&artist.to_lowercase()) { album.to_owned() } else { format!("{artist} {album}") };
-    let q = format!("search?term={}&types=albums&limit=10&extend=editorialVideo", url_escape(&term));
-    let v = api(http, &q).await?;
-    let hits = v.pointer("/results/albums/data")?.as_array()?;
-    let (_, hit) = best(hits, album, artist, Some(album), true)?;
-    hit.pointer("/attributes/editorialVideo").map(motion_urls).filter(|m| m.square.is_some())
-}
-
-async fn album_by_id(http: &reqwest::Client, id: &str) -> Option<Motion> {
-    let v = api(http, &format!("albums/{id}?extend=editorialVideo")).await?;
-    let album = v.get("data")?.as_array()?.first()?;
-    let name = album.pointer("/attributes/name")?.as_str()?;
-    if is_compilation(name) {
-        return None;
-    }
-    album.pointer("/attributes/editorialVideo").map(motion_urls).filter(|m| m.square.is_some())
-}
-
-/// Apple's artist page: their display name and the hero motion clips.
+/// Apple's artist page: their display name and wordmark.
 pub async fn artist(http: &reqwest::Client, name: &str) -> Option<Artwork> {
     let q = format!("search?term={}&types=artists&limit=10", url_escape(name));
     let v = api(http, &q).await?;
@@ -431,7 +278,7 @@ fn artist_logo(html: &str) -> Option<LogoSrc> {
     // neighbouring artwork's URL and be drawn as the artist's name.
     let at = html.find("\"artistLogo\":{")?;
     // The block is a flat dictionary; a generous window keeps us inside it.
-    let block = &html[at..(at + 1400).min(html.len())];
+    let block = &html[at..html.floor_char_boundary((at + 1400).min(html.len()))];
     let template = url_after_key(block, "{", "url")?.replace("\\/", "/");
     let (w, h) = (number_after(block, "\"width\"")?, number_after(block, "\"height\"")?);
     // Only a real template can be resized; a plain URL is taken as-is.
@@ -477,53 +324,6 @@ fn url_escape(s: &str) -> String {
         }
     }
     out
-}
-
-// ------------------------------------------------------------ HLS picking
-
-/// The best variant of a master playlist no wider than `max_width` (and the
-/// smallest one when they all are), so a sleeve doesn't pull a 1080p clip.
-pub async fn variant(http: &reqwest::Client, master: &str, max_width: u32) -> Option<String> {
-    let (code, text) = get(http, master, None).await.ok()?;
-    if code != 200 {
-        return None;
-    }
-    let mut best: Option<(u32, String)> = None;
-    let mut lines = text.lines();
-    while let Some(line) = lines.next() {
-        if !line.starts_with("#EXT-X-STREAM-INF:") || line.contains("hvc1") {
-            continue;
-        }
-        let Some(res) = line.split("RESOLUTION=").nth(1) else { continue };
-        let w = res.split('x').next()?.trim().parse::<u32>().ok()?;
-        let uri = lines.find(|l| !l.trim().is_empty() && !l.starts_with('#'))?;
-        if w <= max_width && best.as_ref().is_none_or(|b| w > b.0) {
-            best = Some((w, uri.trim().to_owned()));
-        }
-    }
-    let uri = best.map(|b| b.1)?;
-    Some(resolve(master, &uri))
-}
-
-/// The single fragmented MP4 a media playlist's segments all point into.
-pub async fn media_file(http: &reqwest::Client, media: &str) -> Option<String> {
-    let (code, text) = get(http, media, None).await.ok()?;
-    if code != 200 {
-        return None;
-    }
-    let line = text.lines().find(|l| l.starts_with("#EXT-X-MAP:"))?;
-    let uri = line.split("URI=\"").nth(1)?.split('"').next()?;
-    Some(resolve(media, uri))
-}
-
-fn resolve(base: &str, uri: &str) -> String {
-    if uri.starts_with("http") {
-        return uri.to_owned();
-    }
-    match base.rfind('/') {
-        Some(i) => format!("{}/{}", &base[..i], uri),
-        None => uri.to_owned(),
-    }
 }
 
 #[cfg(test)]
@@ -572,19 +372,6 @@ mod tests {
     }
 
     #[test]
-    fn scoring_rejects_the_wrong_artist_and_ranks_the_right_release() {
-        let hit = |name: &str, artist: &str, album: &str| {
-            serde_json::json!({"attributes": {"name": name, "artistName": artist, "albumName": album}})
-        };
-        assert!(score("Birds of a Feather", "Billie Eilish", Some("HIT ME HARD AND SOFT"), &hit("Birds of a Feather", "Billie Eilish", "HIT ME HARD AND SOFT"), false).is_some_and(|s| s >= MIN_SCORE));
-        assert!(best(&[hit("Birds of a Feather", "Someone Else", "X")], "Birds of a Feather", "Billie Eilish", None, false).is_none());
-        // Same artist, another song: kept out.
-        assert!(best(&[hit("Lunch", "Billie Eilish", "HIT ME HARD AND SOFT")], "Birds of a Feather", "Billie Eilish", None, false).is_none());
-        // A playlist dressed up as an album is never it.
-        assert!(best(&[hit("Apple Music Essentials", "Billie Eilish", "")], "HIT ME HARD AND SOFT", "Billie Eilish", None, true).is_none());
-    }
-
-    #[test]
     fn the_artist_page_title_names_the_artist() {
         let page = "<title>\u{200e}Charli xcx - Apple Music</title>";
         assert_eq!(page_title(page).as_deref(), Some("Charli xcx"));
@@ -605,9 +392,13 @@ mod tests {
     }
 
     #[test]
-    fn a_media_playlist_resolves_its_one_file() {
-        let media = "https://mvod.itunes.apple.com/a/b/c/clip.m3u8";
-        assert_eq!(resolve(media, "clip-.mp4"), "https://mvod.itunes.apple.com/a/b/c/clip-.mp4");
-        assert_eq!(resolve(media, "https://x/y.m3u8"), "https://x/y.m3u8");
+    fn artist_logo_handles_unicode_at_the_lookup_boundary() {
+        let mut html = r#"{"artistLogo":{"dictionary":{"url":"https://img/{w}x{h}{c}.{f}","width":100,"height":50},"padding":""#.to_owned();
+        // The lookup starts at byte 1 and ends at byte 1401, inside this character.
+        html.extend(std::iter::repeat_n('x', 1400 - html.len()));
+        html.push_str("é\"}}");
+        let logo = artist_logo(&html).expect("complete logo metadata before the boundary");
+        assert_eq!((logo.w, logo.h), (100, 50));
     }
+
 }

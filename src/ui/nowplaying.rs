@@ -279,14 +279,6 @@ fn cover_column(app: &mut App, ui: &mut Ui, col: Rect, track: &crate::model::Tra
         }
     } else {
         widgets::paint_cover_xfade_px(ui, egui::Id::unique("np-art"), art, &track.thumbs, radius, 1.0, px);
-        // Apple's motion sleeve, over the still until its first frame arrives.
-        if let Some(album) = track.album.as_ref().map(|a| a.name.clone()).filter(|a| !a.is_empty()) {
-            let artist = track.artists.first().map(|a| a.name.clone()).unwrap_or_else(|| track.artist_line());
-            app.apple_cover(&album, &artist, Some(&track.title));
-            if let Some(s) = app.apple_sprite(ui.ctx(), &album, &artist, px) {
-                widgets::paint_motion(ui, art, radius, &s);
-            }
-        }
         if cs.brightness < 0.99 {
             ui.painter().rect_filled(art, cr, theme::shade(1.0 - cs.brightness));
         }

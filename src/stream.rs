@@ -78,7 +78,6 @@ struct Inner {
     /// Block a reader most recently needed; workers prioritize from here.
     want: usize,
     error: Option<String>,
-    readers: usize,
     /// Set once a reader existed and all were dropped.
     cancelled: bool,
     /// Blocks the workers may fetch; lifted to all of them when a reader opens.
@@ -121,8 +120,6 @@ pub struct Shared {
     pub format: Format,
     /// What the player can say about this stream, when its source reported it (addons).
     pub info: Option<crate::hires::Info>,
-    /// Flips to true once the download task has stopped (complete, failed or cancelled).
-    done: tokio::sync::watch::Sender<bool>,
     /// Wakes waiting workers: `limit` lifted, a reader moved or left, or cancelled.
     changed: tokio::sync::Notify,
 }
@@ -139,7 +136,6 @@ impl Shared {
                 in_flight: vec![false; n],
                 want: 0,
                 error: None,
-                readers: 0,
                 cancelled: false,
                 limit,
                 wants: Vec::new(),
@@ -154,7 +150,6 @@ impl Shared {
             tempo: Arc::new(std::sync::OnceLock::new()),
             format,
             info,
-            done: tokio::sync::watch::Sender::new(false),
             changed: tokio::sync::Notify::new(),
         })
     }
@@ -174,7 +169,6 @@ impl Shared {
             inner.ever = vec![true; n];
             inner.fetched = n;
         }
-        shared.done.send_replace(true);
         shared
     }
 
@@ -196,7 +190,7 @@ impl Shared {
     /// True if at least `n` blocks have been fetched, or the whole file is done.
     pub fn has_buffered(&self, n: usize) -> bool {
         let inner = self.inner.lock().unwrap();
-        inner.fetched >= n || inner.fetched >= inner.blocks.len() || inner.blocks.iter().all(Option::is_some)
+        inner.fetched >= n.min(inner.blocks.len())
     }
 
     /// Wait until at least `blocks` have arrived or the stream completes/fails/cancels.
@@ -211,7 +205,7 @@ impl Shared {
             }
             {
                 let inner = self.inner.lock().unwrap();
-                if inner.cancelled || inner.error.is_some() || inner.fetched >= inner.blocks.len() {
+                if inner.cancelled || inner.error.is_some() {
                     return;
                 }
             }
@@ -238,12 +232,6 @@ impl Shared {
             }
             changed.await;
         }
-    }
-
-    /// Wait until the download stops, however it ends.
-    #[allow(dead_code)]
-    pub async fn finished(&self) {
-        let _ = self.done.subscribe().wait_for(|d| *d).await;
     }
 
     /// Why the download stopped early, if it failed.
@@ -312,7 +300,7 @@ impl Shared {
             }
         }
         // A windowed file may need dropped blocks again while it's being read.
-        if missing || (inner.windowed && inner.readers > 0) { Claim::Wait } else { Claim::Done }
+        if missing || (inner.windowed && !inner.wants.is_empty()) { Claim::Wait } else { Claim::Done }
     }
 
     fn put(&self, idx: usize, data: Bytes) {
@@ -321,9 +309,6 @@ impl Shared {
         inner.in_flight[idx] = false;
         if !std::mem::replace(&mut inner.ever[idx], true) {
             inner.fetched += 1;
-            if inner.fetched == inner.blocks.len() {
-                self.done.send_replace(true);
-            }
         }
         if inner.windowed && !inner.wants.is_empty() {
             for i in 0..inner.blocks.len() {
@@ -389,7 +374,6 @@ impl Drop for DownloadCompletion<'_> {
         if !self.finished {
             self.shared.cancel();
         }
-        self.shared.done.send_replace(true);
     }
 }
 
@@ -650,7 +634,6 @@ impl StreamReader {
         let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         {
             let mut inner = shared.inner.lock().unwrap();
-            inner.readers += 1;
             inner.limit = inner.blocks.len();
             inner.wants.push((id, 0));
         }
@@ -662,9 +645,8 @@ impl StreamReader {
 impl Drop for StreamReader {
     fn drop(&mut self) {
         let mut inner = self.shared.inner.lock().unwrap();
-        inner.readers -= 1;
         inner.wants.retain(|&(id, _)| id != self.id);
-        if inner.readers == 0 {
+        if inner.wants.is_empty() {
             // Stops the workers once their current request finishes.
             inner.cancelled = true;
         }
@@ -1002,12 +984,77 @@ mod tests {
         }
     }
 
-    #[test]
-    fn abandoning_download_marks_buffer_cancelled_and_done() {
-        let shared = Shared::new(BLOCK, 0, None, Format::Aac, None, false);
+    #[tokio::test]
+    async fn abandoning_download_unblocks_a_reader() {
+        let shared = Shared::new(2 * BLOCK, 0, None, Format::Aac, None, false);
+        let mut reader = StreamReader::new(shared.clone());
+        let (sent, received) = std::sync::mpsc::channel();
+        let blocked = std::thread::spawn(move || {
+            reader.seek(SeekFrom::Start(BLOCK)).unwrap();
+            sent.send(reader.read(&mut [0; 1])).unwrap();
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let changed = shared.changed.notified();
+                tokio::pin!(changed);
+                changed.as_mut().enable();
+                if shared.inner.lock().unwrap().wants.iter().any(|&(_, block)| block == 1) {
+                    break;
+                }
+                changed.await;
+            }
+        }).await.unwrap();
         drop(DownloadCompletion { shared: &shared, finished: false });
-        assert!(shared.inner.lock().unwrap().cancelled);
-        assert!(*shared.done.borrow());
+        let error = received.recv_timeout(Duration::from_secs(1)).unwrap().unwrap_err();
+        assert_eq!(error.to_string(), "download cancelled");
+        blocked.join().unwrap();
+        assert_eq!(shared.claim(), Claim::Done);
+    }
+
+    #[tokio::test]
+    async fn windowed_buffers_keep_both_readers_until_the_last_reader_leaves() {
+        let shared = Shared::new(200 * BLOCK, 0, None, Format::Aac, None, false);
+        let data = Bytes::from(vec![7; BLOCK as usize]);
+        let mut first = StreamReader::new(shared.clone());
+        let mut second = StreamReader::new(shared.clone());
+        shared.put(0, data.clone());
+        first.read_exact(&mut [0; 1]).unwrap();
+        let other = std::thread::spawn(move || {
+            second.seek(SeekFrom::Start(100 * BLOCK)).unwrap();
+            second.read_exact(&mut [0; 1]).unwrap();
+            second
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let changed = shared.changed.notified();
+                tokio::pin!(changed);
+                changed.as_mut().enable();
+                if shared.inner.lock().unwrap().wants.iter().any(|&(_, block)| block == 100) {
+                    break;
+                }
+                changed.await;
+            }
+        }).await.unwrap();
+        shared.put(100, data.clone());
+        let mut second = other.join().unwrap();
+        // Both reader windows survive writes far away from one another.
+        shared.put(101, data.clone());
+        {
+            let inner = shared.inner.lock().unwrap();
+            assert!(inner.blocks[0].is_some());
+            assert!(inner.blocks[100].is_some());
+        }
+        first.read_exact(&mut [0; 1]).unwrap();
+        second.read_exact(&mut [0; 1]).unwrap();
+        drop(first);
+        shared.put(102, data);
+        assert!(shared.inner.lock().unwrap().blocks[0].is_none());
+        assert!(!shared.is_complete());
+        // Eviction does not erase how much has buffered over the stream's life.
+        assert!(shared.has_buffered(4));
+        second.read_exact(&mut [0; 1]).unwrap();
+        drop(second);
+        assert_eq!(shared.claim(), Claim::Done);
     }
 
     #[test]
@@ -1130,6 +1177,7 @@ mod tests {
     fn test_empty_buffer_claim() {
         let shared = Shared::new(0, 0, None, Format::Aac, None, false);
         assert_eq!(shared.claim(), Claim::Done);
+        assert!(shared.has_buffered(1));
     }
 
     #[test]

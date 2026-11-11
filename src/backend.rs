@@ -597,16 +597,6 @@ impl Backend {
                     });
                     Resp::AppleArtist { id, info }
                 }
-                Req::AppleCover { key, album, artist, title } => {
-                    let motion = match title.as_deref() {
-                        Some(t) => crate::apple::song_motion(&self.http(), t, &artist, Some(&album)).await,
-                        None => crate::apple::album_motion(&self.http(), &album, &artist).await,
-                    };
-                    if motion.is_none() {
-                        log::debug!("apple: no motion sleeve for '{album}' by '{artist}'");
-                    }
-                    Resp::AppleCover { key, motion }
-                }
                 Req::ArtistSignature { key, endpoint, name } => {
                     let signature = crate::artist_signature::lookup(&self.http(), &endpoint, &name).await;
                     log::info!("artist signature: {}", match &signature {

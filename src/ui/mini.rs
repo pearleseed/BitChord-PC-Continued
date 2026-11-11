@@ -30,19 +30,8 @@ const MIN_W: f32 = 330.0;
 const MAX_W: f32 = 720.0;
 /// Kept above other windows until unpinned.
 const PINNED_BY_DEFAULT: bool = true;
-/// What the strip's × does.
-const CLOSE: CloseButton = CloseButton::LikeFullWindow;
 /// From the work area's corner, the first time.
 const MARGIN: f32 = 16.0;
-
-#[allow(dead_code)]
-#[derive(Clone, Copy, PartialEq)]
-enum CloseButton {
-    /// What the full window's × does: quit, or hide to the tray with "Close to tray".
-    LikeFullWindow,
-    /// Back to the full window (the expand button's job too).
-    Expand,
-}
 
 /// Where a window was: its outer corner in physical pixels, its inner size in points,
 /// and the monitor's scale and the app's zoom then (points are that big).
@@ -491,18 +480,6 @@ pub fn strip(app: &mut App, ui: &mut Ui, now: f64) {
             icon_at(ui, art.center(), icon::MUSIC, 28.0, theme::text_faint());
         }
     }
-    // Apple's motion sleeve, over the still until its first frame arrives.
-    if let Some(t) = &track
-        && let Some(album) = t.album.as_ref().map(|a| a.name.clone()).filter(|a| !a.is_empty())
-    {
-        let artist = t.artists.first().map(|a| a.name.clone()).unwrap_or_else(|| t.artist_line());
-        let px = (art.width() * ctx.pixels_per_point()).round().max(256.0) as u32;
-        app.apple_cover(&album, &artist, Some(&t.title));
-        if let Some(s) = app.apple_sprite(&ctx, &album, &artist, px) {
-            widgets::paint_motion(ui, art, theme::thumb_radius() + 1.0, &s);
-        }
-    }
-
     // Title and artists.
     let x0 = art.right() + 12.0;
     let x1 = r.right() - 10.0;
@@ -559,10 +536,7 @@ pub fn strip(app: &mut App, ui: &mut Ui, now: f64) {
     };
     // The system's frame has its own close button.
     if titlebar::custom() && top_btn(ui, icon::X, "close", "Close", true, false) {
-        match CLOSE {
-            CloseButton::LikeFullWindow => ctx.send_viewport_cmd(ViewportCommand::Close),
-            CloseButton::Expand => app.actions.push(Action::Mini(false)),
-        }
+        ctx.send_viewport_cmd(ViewportCommand::Close);
     }
     if top_btn(ui, icon::MAXIMIZE_2, "full", "Full window (Ctrl+M)", false, false) {
         app.actions.push(Action::Mini(false));

@@ -51,10 +51,6 @@ use dev::{dev_pace, dev_screenshot, dev_var};
 use dialogs::text_field;
 pub use queue::Repeat;
 
-/// Animated sleeves are off until the decoder is fixed: the surfacing call sites stay
-/// in place, so turning this back on is all it takes to try again.
-const MOTION_COVERS: bool = false;
-
 #[derive(Clone, PartialEq, Hash, Debug)]
 pub enum Page {
     Home,
@@ -256,43 +252,6 @@ pub struct RecentSearch {
     pub round: bool,
 }
 
-/// A decoded motion sleeve, uploaded to a texture as frames arrive.
-pub struct MotionView {
-    motion: std::sync::Arc<crate::motion::Motion>,
-    tex: Option<egui::TextureHandle>,
-    seen: u64,
-    /// The width this decoder was started at: a larger view replaces it once.
-    width: u32,
-}
-
-impl MotionView {
-    fn new(motion: std::sync::Arc<crate::motion::Motion>, width: u32) -> Self {
-        Self { motion, tex: None, seen: 0, width }
-    }
-
-    /// The newest frame as a texture, once one has been decoded.
-    fn texture(&mut self, ctx: &egui::Context) -> Option<&egui::TextureHandle> {
-        if let Some((version, frame)) = self.motion.latest()
-            && version != self.seen
-        {
-            self.seen = version;
-            let image = egui::ColorImage::from_rgba_unmultiplied([frame.w, frame.h], &frame.rgba);
-            match &mut self.tex {
-                Some(tex) => tex.set(image, egui::TextureOptions::LINEAR),
-                None => self.tex = Some(ctx.load_texture("apple-motion", image, egui::TextureOptions::LINEAR)),
-            }
-        }
-        self.tex.as_ref()
-    }
-}
-
-impl Drop for MotionView {
-    fn drop(&mut self) {
-        // Off screen: the decoder stops at its next frame instead of looping on.
-        self.motion.stop();
-    }
-}
-
 pub struct App {
     #[cfg(target_os = "macos")]
     macos_chrome: Option<crate::macos_chrome::Chrome>,
@@ -418,15 +377,11 @@ pub struct App {
     // visuals
     art_key: Option<String>,
     art_changed: f64,
-    /// Apple's page for each artist visited (their display name and hero clips).
-    apple_artists: std::collections::HashMap<String, Option<crate::apple::Artwork>>,
-    /// Motion sleeve master playlist per release key (`None`: Apple has none).
-    apple_covers: std::collections::HashMap<String, Option<String>>,
-    /// Releases Apple had nothing for when last asked, and when: asked again after a
+    /// Apple's page for each artist visited (their display name and wordmark).
+    apple_artists: std::collections::HashMap<String, crate::apple::Artwork>,
+    /// Artists Apple had nothing for when last asked, and when: asked again after a
     /// while, since a lookup can fail on a network hiccup rather than for good.
     apple_missed: std::collections::HashMap<String, std::time::Instant>,
-    /// Decoders for the motion sleeves on screen.
-    apple_motion: std::collections::HashMap<String, MotionView>,
     /// Apple lookups already in flight.
     apple_waiting: std::collections::HashSet<String>,
     /// Settings › Artist pages: the listener's own signature service, or empty.
@@ -759,9 +714,7 @@ impl App {
             seek_drag: None,
             art_key: None,
             apple_artists: Default::default(),
-            apple_covers: Default::default(),
             apple_missed: Default::default(),
-            apple_motion: Default::default(),
             apple_waiting: Default::default(),
             signature_api: get("signature_api").unwrap_or_default(),
             signature_tex: Default::default(),
@@ -909,8 +862,6 @@ impl App {
             self.refresh();
             return;
         }
-        // Leaving a page deloads its motion clips: no decoder keeps running unseen.
-        self.apple_motion.clear();
         let prev = std::mem::replace(&mut self.page, page);
         self.back.push(prev);
         self.forward.clear();
@@ -921,7 +872,6 @@ impl App {
         if self.np_open {
             self.np_open = false;
         } else if let Some(p) = self.back.pop() {
-            self.apple_motion.clear();
             self.forward.push(std::mem::replace(&mut self.page, p));
             self.page_loaded();
         }
@@ -929,7 +879,6 @@ impl App {
 
     fn nav_forward(&mut self) {
         if let Some(p) = self.forward.pop() {
-            self.apple_motion.clear();
             self.back.push(std::mem::replace(&mut self.page, p));
             self.page_loaded();
         }
@@ -1018,40 +967,6 @@ impl App {
         }
     }
 
-    /// Ask Apple, once, for the release's motion sleeve.
-    fn apple_cover(&mut self, album: &str, artist: &str, title: Option<&str>) {
-        if !MOTION_COVERS || album.is_empty() || artist.is_empty() {
-            return;
-        }
-        let key = format!("{album}\u{1}{artist}");
-        if self.apple_covers.contains_key(&key) {
-            return;
-        }
-        if self.apple_missed.get(&key).is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(300)) {
-            return;
-        }
-        if !self.apple_waiting.insert(key.clone()) {
-            return;
-        }
-        self.backend.request(Req::AppleCover {
-            key,
-            album: album.to_owned(),
-            artist: artist.to_owned(),
-            title: title.map(str::to_owned),
-        });
-    }
-
-    /// The newest frame of the release's motion sleeve, started the first time it's seen.
-    /// `None` until Apple has answered (or if it has no clip for the release).
-    fn apple_sprite(&mut self, ctx: &egui::Context, album: &str, artist: &str, max_width: u32) -> Option<widgets::MotionSprite> {
-        if !MOTION_COVERS {
-            return None;
-        }
-        let key = format!("{album}\u{1}{artist}");
-        let url = self.apple_covers.get(&key)?.clone()?;
-        self.motion_sprite(ctx, key, &url, max_width)
-    }
-
     /// The artist's handwritten signature, from the service in Settings: asked for once
     /// per name, uploaded the frame it arrives. `None` while it's on its way or when
     /// the service has none for them.
@@ -1093,23 +1008,6 @@ impl App {
         self.signature_images.clear();
         self.signature_missed.clear();
         self.signature_waiting.clear();
-    }
-
-    /// The newest frame of a motion clip, started the first time it's seen. The decoders
-    /// on screen are capped so old pages don't leave threads behind.
-    fn motion_sprite(&mut self, ctx: &egui::Context, key: String, url: &str, max_width: u32) -> Option<widgets::MotionSprite> {
-        // One decoder per release. The strip and the player ask for different sizes, and
-        // replacing it per caller would restart the clip every frame and never show a
-        // frame: a bigger view takes over only when it needs a wider decode.
-        let stale = self.apple_motion.get(&key).map_or(true, |v| v.width < max_width);
-        if stale {
-            if self.apple_motion.len() >= 8 {
-                self.apple_motion.clear();
-            }
-            self.apple_motion.insert(key.clone(), MotionView::new(crate::motion::play(ctx, url, max_width), max_width));
-        }
-        let tex = self.apple_motion.get_mut(&key)?.texture(ctx)?;
-        Some(widgets::MotionSprite { id: tex.id(), size: tex.size_vec2() })
     }
 
     pub(crate) fn initialize_ui(mut self, ctx: &egui::Context) -> Self {

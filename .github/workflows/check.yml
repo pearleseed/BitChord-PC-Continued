@@ -33,15 +33,6 @@ jobs:
         run: cargo +stable test --locked
       - name: Build desktop app
         run: cargo +stable build --locked
-      - name: Verify macOS bundle
-        if: runner.os == 'macOS'
-        shell: bash
-        run: |
-          version=$(cargo +stable metadata --locked --no-deps --format-version 1 | jq -r '.packages[0].version')
-          macos/bundle.sh target/debug/bitchord "$version" dist
-          codesign --verify --strict dist/bitchord.app
-          vtool -show-build dist/bitchord.app/Contents/MacOS/bitchord
-
   jam:
     name: Jam Worker and smoke client
     runs-on: ubuntu-24.04

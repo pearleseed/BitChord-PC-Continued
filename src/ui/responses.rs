@@ -257,7 +257,7 @@ impl App {
                     self.loading = false;
                 }
                 let apple_key = format!("artist:{}", a.id);
-                let answered = self.apple_artists.get(&a.id).is_some_and(Option::is_some);
+                let answered = self.apple_artists.contains_key(&a.id);
                 let cooling = self.apple_missed.get(&apple_key).is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(120));
                 if !answered && !cooling {
                     let id = a.id.clone();
@@ -352,7 +352,7 @@ impl App {
                 match info {
                     Some(artwork) => {
                         self.apple_missed.remove(&key);
-                        self.apple_artists.insert(id, Some(artwork));
+                        self.apple_artists.insert(id, artwork);
                     }
                     None => {
                         self.apple_artists.remove(&id);
@@ -369,18 +369,6 @@ impl App {
                     }
                     None => {
                         self.signature_missed.insert(key, std::time::Instant::now());
-                    }
-                }
-            }
-            Resp::AppleCover { key, motion } => {
-                self.apple_waiting.remove(&key);
-                match motion.and_then(|m| m.square) {
-                    Some(url) => {
-                        self.apple_missed.remove(&key);
-                        self.apple_covers.insert(key, Some(url));
-                    }
-                    None => {
-                        self.apple_missed.insert(key, std::time::Instant::now());
                     }
                 }
             }

@@ -29,7 +29,6 @@ mod macos_chrome;
 mod macos_lock_screen;
 mod media;
 mod model;
-mod motion;
 mod opus;
 mod preset;
 mod shader;
@@ -48,7 +47,7 @@ mod ytm;
 mod vault;
 mod ytmapi;
 
-pub(crate) use app::{DEFAULT_SIZE, MIN_SIZE, data_dir};
+pub(crate) use app::{DEFAULT_SIZE, MIN_SIZE};
 
 fn main() -> eframe::Result {
     app::run()

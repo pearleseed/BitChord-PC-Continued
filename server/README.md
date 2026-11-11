@@ -28,7 +28,7 @@ cd smoke && cargo run         # end-to-end smoke test against it (JAM_URL overri
 
 ## Metrics
 
-The dashboard is [grapedjuice.github.io/ytm-rs/jam/stats](https://grapedjuice.github.io/ytm-rs/jam/stats/) (`site/jam/stats/`).
+The hosted dashboard is [grapedjuice.github.io/ytm-rs/jam/stats](https://grapedjuice.github.io/ytm-rs/jam/stats/).
 `GET /stats` returns aggregate JSON from a single `Stats` Durable Object: live rooms and
 listeners (and the biggest room), totals (rooms created, joins, guest joins, rooms ended,
 sessions and their average length), all-time peaks, and the last 30 days of rooms, joins

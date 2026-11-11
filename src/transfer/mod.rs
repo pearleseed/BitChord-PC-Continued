@@ -266,7 +266,7 @@ impl Transfer {
     fn find_resumable(&self) -> Option<Resumable> {
         let newest = std::fs::read_dir(self.dir()).ok()?.flatten().filter(|e| e.path().extension().is_some_and(|x| x == "json")).max_by_key(|e| e.metadata().and_then(|m| m.modified()).ok())?;
         let s: Saved = serde_json::from_slice(&std::fs::read(newest.path()).ok()?).ok()?;
-        let source = if s.key == "liked" { Source::Liked } else { Source::Playlist(s.key.clone()) };
+        let source = Source::parse_key(&s.key);
         Some(Resumable {
             source,
             name: s.name,
@@ -357,7 +357,7 @@ impl Transfer {
     /// Look up a pasted playlist link (once per link), so the page can show what it is.
     pub fn look_up(self: &Arc<Self>, rt: &crate::backend::Backend, link: &str) {
         let link = link.trim().to_owned();
-        {
+        let id = {
             let mut slot = self.lookup.lock().unwrap();
             if slot.as_ref().is_some_and(|(l, _)| *l == link) {
                 return;
@@ -369,17 +369,21 @@ impl Transfer {
                     return;
                 }
             };
-            if source == Source::Liked {
-                let entry = spotify::Entry { source, name: "Liked Songs".into(), owner: String::new(), count: None, art: None };
-                *slot = Some((link, Some(Ok(entry))));
-                return;
+            match source {
+                Source::Liked => {
+                    let entry = spotify::Entry { source: Source::Liked, name: "Liked Songs".into(), owner: String::new(), count: None, art: None };
+                    *slot = Some((link, Some(Ok(entry))));
+                    return;
+                }
+                Source::Playlist(id) => {
+                    *slot = Some((link.clone(), None));
+                    id
+                }
             }
-            *slot = Some((link.clone(), None));
-        }
+        };
         let this = self.clone();
         rt.spawn(async move {
             let res = async {
-                let Source::Playlist(id) = Source::parse(&link)? else { unreachable!() };
                 let client = spotify::Client::connect(this.cookie().as_deref(), &this.data_dir).await?;
                 client.playlist_info(&id).await
             }

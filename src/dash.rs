@@ -12,6 +12,8 @@ const FETCH_TIMEOUT: Duration = Duration::from_secs(20);
 /// A rendition bigger than this isn't a song; don't hold it in memory.
 const MAX_BYTES: usize = 96 * 1024 * 1024;
 const PARALLEL: usize = 6;
+/// Keep malformed timelines from expanding an unbounded number of URLs.
+const SEGMENT_LIMIT: u64 = 100_000;
 
 pub struct Audio {
     /// Interleaved stereo 16-bit PCM, little-endian.
@@ -48,8 +50,14 @@ pub async fn fetch(http: &reqwest::Client, mpd_url: &str) -> anyhow::Result<Audi
 }
 
 async fn get(http: &reqwest::Client, url: &str) -> anyhow::Result<bytes::Bytes> {
-    let r = http.get(url).timeout(FETCH_TIMEOUT).header("User-Agent", crate::hires::USER_AGENT).send().await?.error_for_status()?;
-    Ok(r.bytes().await?)
+    let mut response = http.get(url).timeout(FETCH_TIMEOUT).header("User-Agent", crate::hires::USER_AGENT).send().await?.error_for_status()?;
+    anyhow::ensure!(response.content_length().is_none_or(|size| size <= MAX_BYTES as u64), "the Atmos segment is too large");
+    let mut bytes = bytes::BytesMut::new();
+    while let Some(chunk) = response.chunk().await? {
+        anyhow::ensure!(chunk.len() <= MAX_BYTES - bytes.len(), "the Atmos segment is too large");
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes.freeze())
 }
 
 /// The rendition's segment addresses, read out of the MPD.
@@ -116,7 +124,10 @@ impl Plan {
                 let token = &s[start + 1..end - 1];
                 let width = token.split('%').nth(1).and_then(|w| w.trim_start_matches('0').trim_end_matches('d').parse::<usize>().ok());
                 let text = match width {
-                    Some(w) => format!("{number:0w$}"),
+                    Some(w) => {
+                        anyhow::ensure!(w <= 20, "the segment number padding is too large");
+                        format!("{number:0w$}")
+                    }
                     None => number.to_string(),
                 };
                 s.replace_range(start..end, &text);
@@ -124,6 +135,7 @@ impl Plan {
             Ok(if url::Url::parse(&s).is_ok() { s } else { base.join(&s)?.into() })
         };
         let timescale: u64 = template.attribute("timescale").and_then(|v| v.parse().ok()).unwrap_or(1);
+        anyhow::ensure!(timescale > 0, "the rendition has a zero timescale");
         let start: u64 = template.attribute("startNumber").and_then(|v| v.parse().ok()).unwrap_or(1);
         let init = address(template.attribute("initialization").ok_or_else(|| anyhow::anyhow!("no initialization segment"))?, start, 0)?;
         let media = template.attribute("media").ok_or_else(|| anyhow::anyhow!("no media template"))?;
@@ -135,13 +147,18 @@ impl Plan {
                     time = t;
                 }
                 let d: u64 = s.attribute("d").and_then(|v| v.parse().ok()).ok_or_else(|| anyhow::anyhow!("a segment has no duration"))?;
+                anyhow::ensure!(d > 0, "a segment has zero duration");
                 let r: i64 = s.attribute("r").and_then(|v| v.parse().ok()).unwrap_or(0);
                 let count = if r < 0 {
                     // Repeats until the period ends.
-                    ((period_ms as u128 * timescale as u128 / 1000).saturating_sub(time as u128) / d as u128) as u64
+                    (period_ms as u128 * timescale as u128 / 1000).saturating_sub(time as u128) / d as u128
                 } else {
-                    r as u64 + 1
+                    r as u128 + 1
                 };
+                anyhow::ensure!(count < SEGMENT_LIMIT as u128 - segments.len() as u128, "the rendition lists too many segments");
+                let count = count as u64;
+                anyhow::ensure!(d.checked_mul(count).and_then(|span| time.checked_add(span)).is_some(), "segment time overflow");
+                anyhow::ensure!(number.checked_add(count).is_some(), "segment number overflow");
                 for _ in 0..count {
                     segments.push(address(media, number, time)?);
                     time += d;
@@ -149,9 +166,13 @@ impl Plan {
                 }
             }
         } else if let Some(d) = template.attribute("duration").and_then(|v| v.parse::<u64>().ok()) {
+            anyhow::ensure!(d > 0, "a segment has zero duration");
             let total = period_ms as u128 * timescale as u128 / 1000;
-            let count = total.div_ceil(d as u128) as u64;
-            anyhow::ensure!(count > 0 && count < 100_000, "the rendition's length is unknown");
+            let count = total.div_ceil(d as u128);
+            anyhow::ensure!(count > 0 && count < SEGMENT_LIMIT as u128, "the rendition's length is unknown or too large");
+            let count = count as u64;
+            anyhow::ensure!(start.checked_add(count - 1).is_some(), "segment number overflow");
+            anyhow::ensure!((count - 1).checked_mul(d).is_some(), "segment time overflow");
             for i in 0..count {
                 segments.push(address(media, start + i, i * d)?);
             }
@@ -168,9 +189,9 @@ fn duration_attr(v: Option<&str>) -> Option<u64> {
     for c in s.chars() {
         match c {
             '0'..='9' | '.' => num.push(c),
-            'H' => { ms += (num.parse::<f64>().ok()? * 3_600_000.0) as u64; num.clear(); }
-            'M' => { ms += (num.parse::<f64>().ok()? * 60_000.0) as u64; num.clear(); }
-            'S' => { ms += (num.parse::<f64>().ok()? * 1000.0) as u64; num.clear(); }
+            'H' => { ms = ms.checked_add((num.parse::<f64>().ok()? * 3_600_000.0) as u64)?; num.clear(); }
+            'M' => { ms = ms.checked_add((num.parse::<f64>().ok()? * 60_000.0) as u64)?; num.clear(); }
+            'S' => { ms = ms.checked_add((num.parse::<f64>().ok()? * 1000.0) as u64)?; num.clear(); }
             _ => return None,
         }
     }
@@ -231,7 +252,7 @@ fn mdat_payloads(bytes: &[u8]) -> Vec<&[u8]> {
             0 => (8, bytes.len() - i),
             _ => (8, size),
         };
-        if size < header || i + size > bytes.len() {
+        if size < header || size > bytes.len() - i {
             break;
         }
         if kind == b"mdat" {
@@ -293,6 +314,104 @@ fn wav(pcm: &[i16], sample_rate: u32) -> Vec<u8> {
 mod tests {
     use super::*;
 
+    fn manifest(template: &str) -> String {
+        format!(r#"<MPD mediaPresentationDuration="PT4S"><Period><AdaptationSet>
+          <Representation id="audio" codecs="ec-3"><SegmentTemplate initialization="init.mp4" media="seg-$Number$.m4s" {template}
+          </Representation></AdaptationSet></Period></MPD>"#)
+    }
+
+    #[test]
+    fn rejects_zero_segment_duration() {
+        for template in [r#"duration="0"/>"#, r#"><SegmentTimeline><S d="0" r="-1"/></SegmentTimeline></SegmentTemplate>"#] {
+            assert!(Plan::parse(&manifest(template), "https://example.com/a.mpd").is_err());
+        }
+    }
+
+    #[test]
+    fn rejects_zero_timescale() {
+        let xml = manifest(r#"timescale="0"><SegmentTimeline><S d="1"/></SegmentTimeline></SegmentTemplate>"#);
+        assert!(Plan::parse(&xml, "https://example.com/a.mpd").is_err());
+    }
+
+    #[test]
+    fn rejects_excessive_cumulative_timeline_repeats() {
+        let xml = manifest(r#"><SegmentTimeline><S d="1" r="49999"/><S d="1" r="49999"/></SegmentTimeline></SegmentTemplate>"#);
+        assert!(Plan::parse(&xml, "https://example.com/a.mpd").is_err());
+    }
+
+    #[test]
+    fn rejects_segment_address_arithmetic_overflow() {
+        for template in [
+            r#"startNumber="18446744073709551615"><SegmentTimeline><S d="1" r="1"/></SegmentTimeline></SegmentTemplate>"#,
+            r#"><SegmentTimeline><S t="18446744073709551615" d="1"/></SegmentTimeline></SegmentTemplate>"#,
+        ] {
+            assert!(Plan::parse(&manifest(template), "https://example.com/a.mpd").is_err());
+        }
+    }
+
+    #[test]
+    fn rejects_excessive_segment_number_padding() {
+        let xml = manifest(r#"duration="1"/>"#).replace("seg-$Number$.m4s", "seg-$Number%01000d$.m4s");
+        assert!(Plan::parse(&xml, "https://example.com/a.mpd").is_err());
+    }
+
+    #[test]
+    fn rejects_overflowing_presentation_duration() {
+        assert_eq!(duration_attr(Some("PT18446744073709551615H1S")), None);
+    }
+
+    #[tokio::test]
+    async fn media_responses_respect_the_byte_limit() {
+        use std::io::{Read, Write};
+        for (chunked, size, expected) in [
+            (false, MAX_BYTES + 1, None), (true, MAX_BYTES + 1, None),
+            (false, 3, Some([0, 0, 0])), (true, 3, Some([0, 0, 0])),
+        ] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://{}/audio", listener.local_addr().unwrap());
+            let server = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+                socket.set_write_timeout(Some(Duration::from_secs(2))).unwrap();
+                let _ = socket.read(&mut [0; 4096]);
+                let header = if chunked {
+                    "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n".to_owned()
+                } else {
+                    format!("HTTP/1.1 200 OK\r\nContent-Length: {size}\r\nConnection: close\r\n\r\n")
+                };
+                if socket.write_all(header.as_bytes()).is_err() { return; }
+                let block = [0u8; 64 * 1024];
+                let mut left = size;
+                while left > 0 {
+                    let n = left.min(block.len());
+                    if chunked && write!(socket, "{n:x}\r\n").is_err() { return; }
+                    if socket.write_all(&block[..n]).is_err() { return; }
+                    if chunked && socket.write_all(b"\r\n").is_err() { return; }
+                    left -= n;
+                }
+                if chunked { let _ = socket.write_all(b"0\r\n\r\n"); }
+            });
+            let http = reqwest::Client::builder().no_proxy().build().unwrap();
+            let result = get(&http, &url).await;
+            server.join().unwrap();
+            match expected {
+                Some(bytes) => assert_eq!(result.unwrap().as_ref(), bytes),
+                None => assert!(result.is_err_and(|error| error.to_string().contains("too large"))),
+            }
+        }
+    }
+
+    #[test]
+    fn duration_templates_and_timeline_repeats_keep_their_addresses() {
+        let xml = manifest(r#"duration="2" startNumber="7"/>"#)
+            .replace("seg-$Number$.m4s", "seg-$Number%05d$-$Time$.m4s");
+        let plan = Plan::parse(&xml, "https://example.com/a.mpd").unwrap();
+        assert_eq!(plan.segments, ["https://example.com/seg-00007-0.m4s", "https://example.com/seg-00008-2.m4s"]);
+        let xml = manifest(r#"timescale="10"><SegmentTimeline><S d="20" r="-1"/></SegmentTimeline></SegmentTemplate>"#);
+        let plan = Plan::parse(&xml, "https://example.com/a.mpd").unwrap();
+        assert_eq!(plan.segments, ["https://example.com/seg-1.m4s", "https://example.com/seg-2.m4s"]);
+    }
+
     #[test]
     fn iso_durations() {
         assert_eq!(duration_attr(Some("PT3M23.648S")), Some(203_648));
@@ -328,6 +447,18 @@ mod tests {
         bytes.extend_from_slice(b"mdat");
         bytes.extend_from_slice(&[1, 2, 3, 4]);
         assert_eq!(mdat_payloads(&bytes), vec![&[1u8, 2, 3, 4][..]]);
+    }
+
+    #[test]
+    fn mdat_rejects_extended_lengths_beyond_the_remaining_bytes() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&9u32.to_be_bytes());
+        bytes.extend_from_slice(b"mdat");
+        bytes.push(7);
+        bytes.extend_from_slice(&1u32.to_be_bytes());
+        bytes.extend_from_slice(b"mdat");
+        bytes.extend_from_slice(&u64::MAX.to_be_bytes());
+        assert_eq!(mdat_payloads(&bytes), vec![&[7u8][..]]);
     }
 
     #[test]

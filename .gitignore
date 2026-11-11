@@ -6,23 +6,13 @@ target-bisect/
 *.profraw
 *.profdata
 
-# Distribution & packaging outputs
-dist/
-installer/Output/
-/installed/
-/portable/
-/bitchord/
-*.app/
-*.dmg
-*.pkg
-
 # Environment & secrets
 .env
 .env.*
 !.env.example
 !.env.template
 
-# Node / Server / Cloudflare Workers
+# Jam server / Cloudflare Workers
 node_modules/
 .wrangler/
 server/build/

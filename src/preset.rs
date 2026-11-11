@@ -2,7 +2,7 @@
 //! (github.com/better-lyrics/themes). Those are CSS for the YouTube Music website,
 //! which this app can't run, so each one is reduced to the knobs this renderer has:
 //! the background shader, lyric styling, cover treatment and chrome. The data lives
-//! in `assets/themes/presets.json`; covers in `assets/themes/covers/<id>.jpg`.
+//! in `assets/themes/presets.json`.
 
 use std::sync::OnceLock;
 
@@ -434,17 +434,15 @@ pub fn active() -> &'static Preset {
 mod tests {
     use super::*;
 
-    /// Every bundled preset parses, has a cover thumbnail and a unique id.
+    /// Every bundled preset parses, has its display metadata and a unique id.
     #[test]
     fn presets_are_complete() {
         let list: Vec<Preset> = serde_json::from_str(include_str!("../assets/themes/presets.json")).expect("presets.json parses");
         assert_eq!(list.len(), 27);
-        let covers = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/themes/covers");
         let mut ids = std::collections::HashSet::new();
         for p in &list {
             assert!(ids.insert(p.id.clone()), "duplicate id {}", p.id);
             assert!(!p.name.is_empty() && !p.creators.is_empty() && !p.blurb.is_empty(), "{} lacks name/creators/blurb", p.id);
-            assert!(covers.join(format!("{}.jpg", p.id)).is_file(), "{} has no cover", p.id);
             assert!(matches!(p.accent.as_str(), "cover" | "system" | "") || hex(&p.accent).is_some(), "{} accent {}", p.id, p.accent);
         }
         assert_eq!(all().len(), list.len() + 1);
