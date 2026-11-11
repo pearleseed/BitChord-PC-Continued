@@ -2,6 +2,8 @@
 //! animated background. The lyrics themselves are drawn by `karaoke` (a port of the
 //! better-lyrics renderer); this adds their toolbar and the plain-text fallback.
 
+use std::time::Duration;
+
 use egui::{Color32, Rect, Sense, Ui, Vec2, pos2, vec2};
 
 use super::widgets::{self, icon_button, named, text_at};
@@ -54,7 +56,16 @@ pub fn overlay(app: &mut App, ctx: &egui::Context, now: f64) {
                 }
             } else if let Some(bg) = app.bg.as_ref().filter(|_| art) {
                 let blend = theme::ease_in_out(((now - app.art_changed) / 1.4) as f32);
-                let level = if app.reactive_bg && app.playing() && !theme::reduce_motion() { app.audio.status.level() * b.reactive } else { 0.0 };
+                let live = app.playing() && !theme::reduce_motion();
+                let reactive = live && app.reactive_bg && b.reactive != 0.0;
+                let moving = live && app.anim_bg && b.mode == BgMode::Kawarp && b.speed > 0.0 && b.intensity > 0.0;
+                if blend < 1.0 {
+                    ctx.request_repaint_after(Duration::from_millis(33));
+                } else if moving || reactive {
+                    // Slow background motion needs fewer frames than lyrics or controls.
+                    ctx.request_repaint_after(Duration::from_millis(42));
+                }
+                let level = if reactive { app.audio.status.level() * b.reactive } else { 0.0 };
                 bg.paint(
                     &painter,
                     rect,
@@ -250,7 +261,8 @@ fn cover_column(app: &mut App, ui: &mut Ui, col: Rect, track: &crate::model::Tra
     }
     let tint = Color32::from_gray((cs.brightness.clamp(0.1, 1.0) * 255.0) as u8);
     if round {
-        if cs.shape == Shape::Record && app.playing() {
+        if cs.shape == Shape::Record && app.playing() && !theme::reduce_motion() {
+            ui.ctx().request_repaint_after(Duration::from_millis(33));
             let dt = ui.input(|i| i.stable_dt).min(0.1) as f64;
             app.record_angle = (app.record_angle + dt * std::f64::consts::TAU / cs.spin_secs.max(4.0) as f64) % std::f64::consts::TAU;
         }
@@ -571,7 +583,7 @@ fn decorations<'a>(
     extras: Option<&'a (String, String, String, crate::translate::Extras)>,
     id: &str,
     lyrics: &'a Lyrics,
-) -> (Vec<Option<karaoke::Roman<'a>>>, Vec<Option<&'a str>>) {
+) -> karaoke::Decorations<'a> {
     let extras = extras.filter(|(v, s, t, _)| v == id && s == lyrics.provider.key() && t == target).map(|(_, _, _, e)| e);
     let same = |a: &str, b: &str| a.trim().eq_ignore_ascii_case(b.trim());
     let roman = lyrics
@@ -617,33 +629,27 @@ fn synced(app: &mut App, ui: &mut Ui, rect: Rect, id: &str, lyrics: &Lyrics, now
     };
     let pos = app.lyric_clock.tick(pos, playing, now);
     let t = pos - app.lyric_prefs.offset(id, lyrics.provider, lyrics.sync == Sync::Word);
-    let (roman, trans) = decorations(app.show_roman, app.show_trans, &app.lyric_prefs.target, app.lyrics_extras.as_ref(), id, lyrics);
+    let (show_roman, show_trans) = (app.show_roman, app.show_trans);
+    let target = &app.lyric_prefs.target;
+    let extras = app.lyrics_extras.as_ref();
     let key = {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
-        id.hash(&mut h);
-        lyrics.provider.key().hash(&mut h);
-        app.theme_id.hash(&mut h);
-        for r in &roman {
-            match r {
-                Some(karaoke::Roman::Timed(_, s)) | Some(karaoke::Roman::Text(s)) => s.hash(&mut h),
-                None => 0u8.hash(&mut h),
-            }
-        }
-        trans.hash(&mut h);
+        (id, lyrics.provider, &app.theme_id, show_roman, show_trans, target).hash(&mut h);
         h.finish()
     };
     let scale = app.lyric_prefs.text_scale;
-    let frame = karaoke::Frame { lyrics, key, roman, trans, t, playing, now, rect, style, accent, centered, scale };
-    // The view lives in `app`; the frame borrows `app` for decorations, so swap it out.
-    let mut view = std::mem::take(&mut app.lyric_view);
-    let out = if karaoke::dev_off("view") { karaoke::Out { seek: None, animating: true, user_scrolling: false } } else { view.show(ui, frame) };
-    app.lyric_view = view;
+    let frame = karaoke::Frame { lyrics, key, t, playing, now, rect, style, accent, centered, scale };
+    let out = if karaoke::dev_off("view") {
+        karaoke::Out { seek: None, animating: true, user_scrolling: false }
+    } else {
+        app.lyric_view.show(ui, frame, || decorations(show_roman, show_trans, target, extras, id, lyrics))
+    };
     if let Some(s) = out.seek {
         app.actions.push(Action::Seek(s as f32));
     }
     if out.animating {
-        ui.ctx().request_repaint();
+        ui.ctx().request_repaint_after(Duration::from_millis(16));
     }
     // The extension's `.autoscroll-resume-button` (YouTube Music's rem is 10 px): a frosted
     // pill under the top edge in the lyrics font at 600, 1.75rem; padding .5rem 1rem;

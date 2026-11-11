@@ -484,6 +484,9 @@ pub enum Resp {
         generation: u64,
         active: bool,
     },
+    QualityUnavailable {
+        generation: u64,
+    },
     /// Play `generation` is the song version of the music video that was asked for
     /// (`None`: that song wouldn't start, and the music video plays after all).
     PlayingAs {

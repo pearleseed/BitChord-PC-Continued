@@ -64,16 +64,28 @@ float hash(vec3 p) {
 void main() {
   // Zoom in so warped edges never show the clamp.
   vec2 uv = (v_uv - 0.5) / u_scale + 0.5;
-  float t = u_time * 0.05;
-  float centerWeight = 1.0 - smoothstep(0.0, 0.7, length(uv - 0.5));
-  float n1 = snoise(uv * 0.35 + vec2(t, t * 0.7));
-  float n2 = snoise(uv * 0.35 + vec2(-t * 0.8, t * 0.5) + vec2(50.0, 50.0));
-  float n3 = snoise(uv * 0.9 + vec2(t * 1.2, -t) + vec2(100.0, 0.0));
-  float n4 = snoise(uv * 0.9 + vec2(-t, t * 1.1) + vec2(0.0, 100.0));
-  vec2 warp = vec2(n1 * 0.65 + n3 * 0.35, n2 * 0.65 + n4 * 0.35) * centerWeight;
-  vec2 w = clamp(uv + warp * u_intensity, 0.0, 1.0);
+  vec2 w = uv;
+  if (u_intensity != 0.0) {
+    float t = u_time * 0.05;
+    float centerWeight = 1.0 - smoothstep(0.0, 0.7, length(uv - 0.5));
+    float n1 = snoise(uv * 0.35 + vec2(t, t * 0.7));
+    float n2 = snoise(uv * 0.35 + vec2(-t * 0.8, t * 0.5) + vec2(50.0, 50.0));
+    float n3 = snoise(uv * 0.9 + vec2(t * 1.2, -t) + vec2(100.0, 0.0));
+    float n4 = snoise(uv * 0.9 + vec2(-t, t * 1.1) + vec2(0.0, 100.0));
+    vec2 warp = vec2(n1 * 0.65 + n3 * 0.35, n2 * 0.65 + n4 * 0.35) * centerWeight;
+    w += warp * u_intensity;
+  }
+  w = clamp(w, 0.0, 1.0);
 
-  vec3 color = mix(TEX(u_b, w).rgb, TEX(u_a, w).rgb, u_blend);
+  vec3 color;
+  if (u_blend == 0.0) {
+    color = TEX(u_b, w).rgb;
+  } else {
+    color = TEX(u_a, w).rgb;
+    if (u_blend != 1.0) {
+      color = mix(TEX(u_b, w).rgb, color, u_blend);
+    }
+  }
 
   vec2 c = v_uv - 0.5;
   color *= 1.0 - dot(c, c) * 0.3;
@@ -161,16 +173,28 @@ fn hash(q: vec3<f32>) -> f32 {
 @fragment
 fn fs_main(in: VOut) -> @location(0) vec4<f32> {
   let uv = (in.uv - 0.5) / u.scale + 0.5;
-  let t = u.time * 0.05;
-  let centerWeight = 1.0 - smoothstep(0.0, 0.7, length(uv - 0.5));
-  let n1 = snoise(uv * 0.35 + vec2<f32>(t, t * 0.7));
-  let n2 = snoise(uv * 0.35 + vec2<f32>(-t * 0.8, t * 0.5) + vec2<f32>(50.0, 50.0));
-  let n3 = snoise(uv * 0.9 + vec2<f32>(t * 1.2, -t) + vec2<f32>(100.0, 0.0));
-  let n4 = snoise(uv * 0.9 + vec2<f32>(-t, t * 1.1) + vec2<f32>(0.0, 100.0));
-  let warp = vec2<f32>(n1 * 0.65 + n3 * 0.35, n2 * 0.65 + n4 * 0.35) * centerWeight;
-  let w = clamp(uv + warp * u.intensity, vec2<f32>(0.0), vec2<f32>(1.0));
+  var w = uv;
+  if (u.intensity != 0.0) {
+    let t = u.time * 0.05;
+    let centerWeight = 1.0 - smoothstep(0.0, 0.7, length(uv - 0.5));
+    let n1 = snoise(uv * 0.35 + vec2<f32>(t, t * 0.7));
+    let n2 = snoise(uv * 0.35 + vec2<f32>(-t * 0.8, t * 0.5) + vec2<f32>(50.0, 50.0));
+    let n3 = snoise(uv * 0.9 + vec2<f32>(t * 1.2, -t) + vec2<f32>(100.0, 0.0));
+    let n4 = snoise(uv * 0.9 + vec2<f32>(-t, t * 1.1) + vec2<f32>(0.0, 100.0));
+    let warp = vec2<f32>(n1 * 0.65 + n3 * 0.35, n2 * 0.65 + n4 * 0.35) * centerWeight;
+    w += warp * u.intensity;
+  }
+  w = clamp(w, vec2<f32>(0.0), vec2<f32>(1.0));
 
-  var color = mix(textureSample(tex_b, samp, w).rgb, textureSample(tex_a, samp, w).rgb, u.blend);
+  var color: vec3<f32>;
+  if (u.blend == 0.0) {
+    color = textureSample(tex_b, samp, w).rgb;
+  } else {
+    color = textureSample(tex_a, samp, w).rgb;
+    if (u.blend != 1.0) {
+      color = mix(textureSample(tex_b, samp, w).rgb, color, u.blend);
+    }
+  }
 
   let c = in.uv - 0.5;
   color = color * (1.0 - dot(c, c) * 0.3);
@@ -346,6 +370,7 @@ impl Background {
                 gl.delete_shader(s);
             }
             let vao = gl.create_vertex_array().map_err(anyhow::Error::msg)?;
+            let idle = crate::art::idle();
             let mk = || -> anyhow::Result<glow::Texture> {
                 let t = gl.create_texture().map_err(anyhow::Error::msg)?;
                 gl.bind_texture(glow::TEXTURE_2D, Some(t));
@@ -357,21 +382,26 @@ impl Background {
                 ] {
                     gl.tex_parameter_i32(glow::TEXTURE_2D, p, v as i32);
                 }
+                gl.tex_image_2d(
+                    glow::TEXTURE_2D,
+                    0,
+                    glow::RGBA8 as i32,
+                    SIZE as i32,
+                    SIZE as i32,
+                    0,
+                    glow::RGBA,
+                    glow::UNSIGNED_BYTE,
+                    glow::PixelUnpackData::Slice(Some(&idle.rgba)),
+                );
                 Ok(t)
             };
             let tex = [mk()?, mk()?];
             let loc = UNIFORMS.map(|n| gl.get_uniform_location(program, n));
-            let this = Self {
+            Ok(Self {
                 gl: Arc::new(Mutex::new(Some(Gl { program, vao, tex, cur: 0, loc }))),
                 pending: Default::default(),
                 wgpu: false,
-            };
-            // Both slots start with the idle backdrop.
-            let idle = crate::art::idle();
-            for t in tex {
-                upload(gl, t, &idle);
-            }
-            Ok(this)
+            })
         }
     }
 
@@ -457,7 +487,7 @@ impl eframe::egui_wgpu::CallbackTrait for WgpuPaint {
         let p = &self.p;
         let px = self.rect.size() * screen.pixels_per_point;
         let u = [p.blend, p.time, p.intensity, p.scale, p.saturation, p.dim, px.x, px.y];
-        queue.write_buffer(&s.uniforms, 0, &u.iter().flat_map(|f| f.to_ne_bytes()).collect::<Vec<u8>>());
+        queue.write_buffer(&s.uniforms, 0, u.map(f32::to_ne_bytes).as_flattened());
         Vec::new()
     }
 
@@ -481,13 +511,13 @@ fn upload_wgpu(queue: &wgpu::Queue, tex: &wgpu::Texture, art: &Art) {
 unsafe fn upload(gl: &glow::Context, tex: glow::Texture, art: &Art) {
     unsafe {
         gl.bind_texture(glow::TEXTURE_2D, Some(tex));
-        gl.tex_image_2d(
+        gl.tex_sub_image_2d(
             glow::TEXTURE_2D,
             0,
-            glow::RGBA8 as i32,
-            SIZE as i32,
-            SIZE as i32,
             0,
+            0,
+            SIZE as i32,
+            SIZE as i32,
             glow::RGBA,
             glow::UNSIGNED_BYTE,
             glow::PixelUnpackData::Slice(Some(&art.rgba)),

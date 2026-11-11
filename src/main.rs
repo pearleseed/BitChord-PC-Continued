@@ -25,6 +25,8 @@ mod login;
 mod lyrics;
 #[cfg(target_os = "macos")]
 mod macos_chrome;
+#[cfg(target_os = "macos")]
+mod macos_lock_screen;
 mod media;
 mod model;
 mod motion;

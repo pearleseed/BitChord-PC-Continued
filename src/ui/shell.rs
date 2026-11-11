@@ -44,35 +44,32 @@ fn page_mode(look: &crate::preset::Preset) -> crate::preset::BgMode {
     }
 }
 
-/// Whether the pages' background moves while music plays (static themes need no frames).
-pub fn pages_bg_moves(look: &crate::preset::Preset) -> bool {
+/// Keep the shader clock shared by the page and the overlay.
+pub fn tick_background(app: &mut App, now: f64) {
     use crate::preset::BgMode;
-    let b = &look.background;
-    matches!(page_mode(look), BgMode::Kawarp | BgMode::CoverFullbleed) && b.speed > 0.0 && b.intensity > 0.0
+    let dt = (now - app.last_frame).clamp(0.0, 0.1);
+    app.last_frame = now;
+    let b = &app.look().background;
+    let animated = matches!(b.mode, BgMode::Kawarp | BgMode::CoverFullbleed) && b.speed > 0.0 && b.intensity > 0.0;
+    if app.anim_bg && animated && app.playing() && !theme::reduce_motion() {
+        app.bg_time += dt * b.speed as f64;
+    }
 }
 
-/// `only`: paint just this part (the rest is covered by now playing).
 /// The background's flat colour, under its art and gradients.
 pub fn base_color(app: &App) -> Color32 {
     app.look().solid()
 }
 
-pub fn background(app: &mut App, ui: &mut Ui, screen: Rect, now: f64, only: Option<Rect>) {
+/// `only`: paint just this part (the rest is covered by now playing).
+pub fn background(app: &App, ui: &mut Ui, screen: Rect, now: f64, only: Option<Rect>) {
     use crate::preset::BgMode;
-    let dt = (now - app.last_frame).clamp(0.0, 0.1);
-    app.last_frame = now;
     let look = app.look();
     let b = &look.background;
     let mode = page_mode(look);
     // Light pages are the art at full strength under a white wash, a pale tint of the cover.
     let light = theme::light();
     let dim = if light { 1.0 } else { look.app.page_dim.unwrap_or(b.page_dim).clamp(0.02, 1.0) };
-    // Now playing animates the shader itself, so keep the clock running for it too.
-    let animated = matches!(b.mode, BgMode::Kawarp | BgMode::CoverFullbleed) && b.speed > 0.0;
-    let moving = app.anim_bg && animated && app.playing() && !theme::reduce_motion();
-    if moving {
-        app.bg_time += dt * b.speed as f64;
-    }
     let painter = match only {
         Some(r) => ui.painter().with_clip_rect(r),
         None => ui.painter().clone(),
@@ -85,8 +82,13 @@ pub fn background(app: &mut App, ui: &mut Ui, screen: Rect, now: f64, only: Opti
             // The crossfade to new art finishes even while paused.
             ui.ctx().request_repaint_after(std::time::Duration::from_millis(33));
         }
-        let level = if app.reactive_bg && app.playing() && !theme::reduce_motion() { app.audio.status.level() * b.reactive } else { 0.0 };
         let still = mode == BgMode::CoverStatic;
+        let live = !still && app.playing() && !theme::reduce_motion();
+        let moving = live && app.anim_bg && b.speed > 0.0 && b.intensity > 0.0;
+        if moving && only.is_none() {
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(66));
+        }
+        let level = if live && app.reactive_bg { app.audio.status.level() * b.reactive } else { 0.0 };
         bg.paint(
             &painter,
             screen,
@@ -109,11 +111,6 @@ pub fn background(app: &mut App, ui: &mut Ui, screen: Rect, now: f64, only: Opti
     } else if mode != BgMode::Solid {
         // Keep text readable: darken toward the bottom and under the sidebar.
         vgradient(&painter, screen, theme::shade(0.12), theme::shade(0.55));
-    }
-    if theme::macos_default() {
-        // A restrained cover tint lets the artwork and foreground controls carry
-        // the color. The stronger cover treatment belongs to Now Playing.
-        painter.rect_filled(screen, 0.0, theme::with_alpha(theme::bg(), 0.84));
     }
 }
 

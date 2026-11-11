@@ -617,6 +617,11 @@ pub fn song_menu(ui: &mut Ui, t: &Track, liked: bool, remove: Option<usize>, act
 
 /// The song menu's items, for menus that add their own (now playing's options).
 pub fn song_actions(ui: &mut Ui, t: &Track, liked: bool, remove: Option<usize>, acts: &mut Vec<Action>) {
+    if let Some(id) = t.album.as_ref().and_then(|album| album.id.as_ref()).filter(|id| !id.is_empty())
+        && menu_action(ui, Some(icon::MUSIC), "Open album")
+    {
+        acts.push(Action::Open(Target::Album(id.clone())));
+    }
     if menu_action_star(ui, liked, if liked { "Remove like" } else { "Like song" }) {
         acts.push(Action::Like(t.clone(), !liked));
     }
@@ -670,12 +675,15 @@ impl NowPlaying {
 /// `Some(playing)` when `target` is what's loaded: the current song, or the album /
 /// playlist / artist the queue came from.
 pub fn active_state(ui: &Ui, target: &Target) -> Option<bool> {
-    let np = ui.ctx().data(|d| d.get_temp::<NowPlaying>(NowPlaying::id()))?;
-    let hit = match target {
-        Target::Song(t) => np.song.as_deref() == Some(t.id.as_str()),
-        t => np.source.as_ref() == Some(t),
-    };
-    hit.then_some(np.playing)
+    use egui::util::id_type_map::RawKey;
+    ui.ctx().data(|d| {
+        let np = d.get_temp_raw(RawKey::new::<NowPlaying>(NowPlaying::id()))?.downcast_ref::<NowPlaying>()?;
+        let hit = match target {
+            Target::Song(t) => np.song.as_deref() == Some(t.id.as_str()),
+            t => np.source.as_ref() == Some(t),
+        };
+        hit.then_some(np.playing)
+    })
 }
 
 /// Round button glyph: pause bars while `active` is playing, otherwise a play triangle.
@@ -702,14 +710,13 @@ pub fn play_triangle(ui: &Ui, center: Pos2, r: f32, color: Color32) {
 // ------------------------------------------------------------------ playing bars
 
 /// The playing row's bars: three rounded bars rising and falling at their own slow
-/// pace, settling low when paused. They tell the frame pacing they're on screen, so
-/// they move at a steady rate instead of the page's slower one.
+/// pace, settling low when paused. Only rows on screen schedule their animation.
 pub fn equalizer(ui: &Ui, rect: Rect, time: f64, playing: bool, color: Color32) {
     let ctx = ui.ctx();
     let on = theme::anim_bool(ctx, ui.scope_id().with("eq"), playing, 0.35);
-    if on > 0.0 {
-        let frame = ctx.cumulative_frame_nr();
-        ctx.data_mut(|d| d.insert_temp(equalizer_id(), frame));
+    let moving = !theme::reduce_motion();
+    if playing && moving {
+        ctx.request_repaint_after(std::time::Duration::from_millis(33));
     }
     let px = ctx.pixels_per_point();
     let snap = |v: f32| (v * px).round() / px;
@@ -717,7 +724,7 @@ pub fn equalizer(ui: &Ui, rect: Rect, time: f64, playing: bool, color: Color32) 
     let gap = snap(bar_w * 0.75);
     let total = bar_w * 3.0 + gap * 2.0;
     let left = snap(rect.center().x - total / 2.0);
-    let t = time as f32;
+    let t = if moving { time as f32 } else { 0.0 };
     // Two slow waves per bar, so the motion doesn't visibly repeat.
     const WAVES: [(f32, f32, f32); 3] = [(4.1, 2.3, 0.0), (3.3, 5.2, 1.9), (4.7, 2.9, 3.7)];
     for (i, (a, b, off)) in WAVES.into_iter().enumerate() {
@@ -731,17 +738,6 @@ pub fn equalizer(ui: &Ui, rect: Rect, time: f64, playing: bool, color: Color32) 
         let bar = Rect::from_min_max(pos2(x, snap(rect.bottom()) - h), pos2(x + bar_w, snap(rect.bottom())));
         ui.painter().add(egui::epaint::RectShape::filled(bar, bar_w / 2.0, color).with_round_to_pixels(false));
     }
-}
-
-/// Last frame the playing bars were drawn on (frame pacing reads it).
-pub fn equalizer_id() -> egui::Id {
-    egui::Id::unique("equalizer_frame")
-}
-
-/// Whether the playing bars were on screen last frame.
-pub fn equalizer_shown(ctx: &egui::Context) -> bool {
-    let now = ctx.cumulative_frame_nr();
-    ctx.data(|d| d.get_temp::<u64>(equalizer_id())).is_some_and(|f| f + 1 >= now)
 }
 
 pub struct RowOpts {

@@ -150,9 +150,7 @@ impl DurableObject for Room {
         }));
         // The newcomer already has the list in its welcome.
         let update = json!({ "t": "members", "host": meta.host, "members": list });
-        for (other, _) in &members {
-            send(other, &update);
-        }
+        send_members(&members, &update);
         let ev = if create.as_deref() == Some("1") { "create" } else { "join" };
         self.report(ev, list.len()).await;
         Response::from_websocket(pair.client)
@@ -231,10 +229,11 @@ impl DurableObject for Room {
             "end" => {
                 storage.delete_alarm().await?;
                 storage.delete_all().await?;
+                let ended = json!({ "t": "ended" }).to_string();
                 for (other, mut member) in self.members(None) {
                     member.gone = true;
                     let _ = other.serialize_attachment(&member);
-                    send(&other, &json!({ "t": "ended" }));
+                    send_text(&other, &ended);
                     let _ = other.close(Some(1000), Some("ended"));
                 }
                 self.report("end", 0).await;
@@ -341,9 +340,7 @@ impl Room {
     }
 
     fn broadcast(&self, msg: &Value, skip: Option<&WebSocket>) {
-        for (ws, _) in self.members(skip) {
-            send(&ws, msg);
-        }
+        send_members(&self.members(skip), msg);
     }
 
     /// Runs once per socket, whether it said bye, closed, or errored.
@@ -370,9 +367,7 @@ impl Room {
             storage.put("meta", &meta).await?;
         }
         let update = json!({ "t": "members", "host": meta.host, "members": member_list(&rest) });
-        for (other, _) in &rest {
-            send(other, &update);
-        }
+        send_members(&rest, &update);
         Ok(())
     }
 }
@@ -382,8 +377,22 @@ fn now() -> f64 {
 }
 
 fn send(ws: &WebSocket, msg: &Value) {
+    send_text(ws, &msg.to_string());
+}
+
+fn send_members(members: &[(WebSocket, Member)], msg: &Value) {
+    if members.is_empty() {
+        return;
+    }
+    let text = msg.to_string();
+    for (ws, _) in members {
+        send_text(ws, &text);
+    }
+}
+
+fn send_text(ws: &WebSocket, text: &str) {
     // A socket that's mid-close can refuse sends; that's fine.
-    let _ = ws.send_with_str(msg.to_string());
+    let _ = ws.send_with_str(text);
 }
 
 fn error(ws: &WebSocket, code: &str, msg: &str) -> Result<()> {

@@ -56,6 +56,7 @@ impl Variant {
         Some(if img.width() == size { img } else { image::imageops::resize(&img, size, size, image::imageops::FilterType::Lanczos3) })
     }
 
+    #[cfg(not(target_os = "macos"))]
     pub fn icon_data(&self) -> Option<egui::IconData> {
         let img = self.rgba(256)?;
         Some(egui::IconData { width: img.width(), height: img.height(), rgba: img.into_raw() })

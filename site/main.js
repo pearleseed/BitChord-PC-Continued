@@ -327,19 +327,29 @@ void main(){
       prog.setAttribute("aria-valuenow", Math.round((t / DUR) * 100));
       timeEl.textContent = fmt(t);
     };
+    let frame = null;
     const loop = (now) => {
       const dt = lastNow ? (now - lastNow) / 1000 : 0; lastNow = now;
-      if (playing) { t += Math.min(dt, 0.1); if (t >= DUR) t = 0; }
+      t += Math.min(dt, 0.1);
+      if (t >= DUR) t = 0;
       render();
-      if (visible && playing && !document.hidden) requestAnimationFrame(loop); else lastNow = 0;
+      frame = requestAnimationFrame(loop);
     };
-    const kick = () => { if (visible && playing) { lastNow = 0; requestAnimationFrame(loop); } };
-    new IntersectionObserver((es) => { visible = es[0].isIntersecting; kick(); }, { threshold: 0.2 }).observe(player);
-    document.addEventListener("visibilitychange", kick);
+    const syncAnimation = () => {
+      if (visible && playing && !document.hidden) {
+        if (frame === null) frame = requestAnimationFrame(loop);
+      } else if (frame !== null) {
+        cancelAnimationFrame(frame);
+        frame = null;
+        lastNow = 0;
+      }
+    };
+    new IntersectionObserver((es) => { visible = es[0].isIntersecting; syncAnimation(); }, { threshold: 0.2 }).observe(player);
+    document.addEventListener("visibilitychange", syncAnimation);
 
     const setPlaying = (p) => {
       playing = p; playBtn.classList.toggle("is-paused", !p);
-      playBtn.setAttribute("aria-label", p ? "Pause" : "Play"); kick();
+      playBtn.setAttribute("aria-label", p ? "Pause" : "Play"); syncAnimation();
     };
     setPlaying(playing);
     playBtn.addEventListener("click", () => setPlaying(!playing));

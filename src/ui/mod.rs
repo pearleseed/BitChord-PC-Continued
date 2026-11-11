@@ -13,6 +13,8 @@ mod integrations;
 mod jam;
 mod karaoke;
 mod lists;
+#[cfg(target_os = "macos")]
+mod lock_screen;
 mod lyric_prefs;
 mod mini;
 mod notes;
@@ -170,21 +172,52 @@ impl Selection {
         *self = Self { page: Some(page.clone()), active: true, ..Self::default() };
     }
 
-    /// Toggle row `i`, or with `range` pick every row from the last one toggled to it.
-    pub fn pick(&mut self, page: &Page, i: usize, range: bool) {
+    /// Toggle a row, or pick the range from the last one toggled among the rows shown.
+    pub fn pick(&mut self, page: &Page, i: usize, range: bool, visible: Option<&[usize]>) {
         if self.page.as_ref() != Some(page) {
             *self = Self { page: Some(page.clone()), ..Self::default() };
         }
+        let row = visible.map_or(i, |rows| rows[i]);
         match self.anchor.filter(|_| range) {
-            Some(a) => self.rows.extend(a.min(i)..=a.max(i)),
+            Some(a) if visible.is_none() => self.rows.extend(a.min(row)..=a.max(row)),
+            Some(a) if let Some(rows) = visible && let Ok(anchor) = rows.binary_search(&a) => {
+                self.rows.extend(rows[anchor.min(i)..=anchor.max(i)].iter().copied());
+            }
+            Some(_) => {
+                self.rows.insert(row);
+                self.anchor = Some(row);
+            }
             None => {
-                if !self.rows.remove(&i) {
-                    self.rows.insert(i);
+                if !self.rows.remove(&row) {
+                    self.rows.insert(row);
                 }
-                self.anchor = Some(i);
+                self.anchor = Some(row);
             }
         }
     }
+}
+
+#[cfg(test)]
+#[test]
+fn selecting_a_filtered_range_keeps_the_original_playlist_rows() {
+    let page = Page::Playlist("example".into());
+    let visible = [1, 4, 8];
+    let mut selection = Selection::default();
+    selection.pick(&page, 0, false, Some(&visible));
+    selection.pick(&page, 2, true, Some(&visible));
+    assert_eq!(selection.rows.into_iter().collect::<Vec<_>>(), [1, 4, 8]);
+}
+
+#[cfg(test)]
+#[test]
+fn shift_select_with_a_hidden_anchor_keeps_an_already_selected_song() {
+    let page = Page::Playlist("example".into());
+    let mut selection = Selection::default();
+    selection.pick(&page, 4, false, None);
+    selection.pick(&page, 1, false, None);
+    selection.pick(&page, 0, true, Some(&[4, 8]));
+    assert_eq!(selection.anchor, Some(4));
+    assert_eq!(selection.rows.into_iter().collect::<Vec<_>>(), [1, 4]);
 }
 
 pub struct HomeState {
@@ -263,6 +296,12 @@ impl Drop for MotionView {
 pub struct App {
     #[cfg(target_os = "macos")]
     macos_chrome: Option<crate::macos_chrome::Chrome>,
+    #[cfg(target_os = "macos")]
+    lock_screen: Option<crate::macos_lock_screen::LockScreen>,
+    #[cfg(target_os = "macos")]
+    lock_screen_enabled: bool,
+    #[cfg(target_os = "macos")]
+    lock_screen_hidden_generation: Option<u64>,
     backend: Backend,
     audio: AudioHandle,
     ch: Channels,
@@ -605,6 +644,12 @@ impl App {
         let mut app = Self {
             #[cfg(target_os = "macos")]
             macos_chrome: None,
+            #[cfg(target_os = "macos")]
+            lock_screen: None,
+            #[cfg(target_os = "macos")]
+            lock_screen_enabled: get("lock_screen_player").is_some_and(|value| value == "1"),
+            #[cfg(target_os = "macos")]
+            lock_screen_hidden_generation: None,
             backend,
             audio,
             ch,
@@ -1072,6 +1117,10 @@ impl App {
         let look = self.look();
         theme::apply_chrome(ctx, look);
         self.chrome_applied = Some(look.id.clone());
+        #[cfg(target_os = "macos")]
+        if self.lock_screen_enabled {
+            self.set_lock_screen_enabled(ctx, true);
+        }
         self
     }
 
@@ -1133,10 +1182,11 @@ impl eframe::App for App {
             if forward { self.nav_forward(); }
         }
         dev_pace();
-        self.lyric_view.release_hidden(ctx.cumulative_pass_nr());
         let now = ctx.input(|i| i.time);
         self.sync_look();
         self.pump(now);
+        #[cfg(target_os = "macos")]
+        self.sync_lock_screen();
         self.skip_segments(ctx, now);
         // System media controls and taskbar buttons follow the player however it changed.
         let playing = self.playing();
@@ -1201,17 +1251,14 @@ impl eframe::App for App {
         }
         self.mini.tick(ctx, now);
         self.tray_window(ctx);
-        self.window_hidden = self.tray.is_some() || ctx.input(|i| i.viewport().minimized == Some(true));
+        let (minimized, visible) = ctx.input(|i| (i.viewport().minimized, i.viewport().visible()));
+        self.window_hidden = self.tray.is_some() || minimized == Some(true);
+        let painting_hidden = self.window_hidden || visible == Some(false);
+        self.lyric_view.release_hidden(ctx.cumulative_pass_nr(), painting_hidden);
         self.sync_discord();
         self.sync_lastfm();
         self.sync_server_queue(ctx, now);
         self.tick_updates(ctx, now);
-        let np = widgets::NowPlaying {
-            song: self.current_id().map(str::to_owned),
-            source: self.queue_source.clone(),
-            playing: self.playing() || self.buffering(),
-        };
-        ctx.data_mut(|d| d.insert_temp(widgets::NowPlaying::id(), np));
         if let Some((_, t)) = &mut self.toast {
             if *t < 0.0 {
                 *t = now;
@@ -1219,26 +1266,12 @@ impl eframe::App for App {
                 self.toast = None;
             }
         }
-        // Frame pacing: idle costs nothing. The background drifts slowly, so ~15 fps
-        // reads as smooth on pages; the now-playing view runs at 30 fps (25 on a page
-        // showing the playing row's bars), and the synced
-        // lyrics ask for every frame while they animate (the karaoke sweep must be
-        // smooth). Each egui frame re-lays-out the UI, so frame rate is the main CPU cost.
-        let playing = self.playing();
-        if self.window_hidden {
-            // In the tray or minimized: nothing to draw, only the player bookkeeping.
-            if playing || self.buffering() {
-                ctx.request_repaint_after(Duration::from_millis(250));
-            }
-        } else if self.np_open && playing && !self.mini.busy() {
-            ctx.request_repaint_after(Duration::from_millis(33));
-        } else if playing && widgets::equalizer_shown(ctx) {
-            // The playing row's bars need a steady, full rate to read as smooth.
-            ctx.request_repaint_after(Duration::from_millis(16));
-        } else if playing && self.anim_bg && !theme::reduce_motion() && shell::pages_bg_moves(self.look()) {
-            ctx.request_repaint_after(Duration::from_millis(66));
-        } else if playing || self.buffering() {
-            ctx.request_repaint_after(Duration::from_millis(250));
+        // Visible animations set their own cadence. The progress display and integrations
+        // still need a slow tick between events, including while the window is hidden.
+        if self.playing() || self.buffering() {
+            let needs_fast_tick = self.mix_from.is_some() || self.jam.active() || (self.sponsorblock && self.segments.is_some());
+            let delay = if painting_hidden && !needs_fast_tick { 1000 } else { 250 };
+            ctx.request_repaint_after(Duration::from_millis(delay));
         }
     }
 
@@ -1250,6 +1283,13 @@ impl eframe::App for App {
 
         self.sync_look();
         let look = self.look();
+        shell::tick_background(self, now);
+        let np = widgets::NowPlaying {
+            song: self.current_id().map(str::to_owned),
+            source: self.queue_source.clone(),
+            playing: self.playing() || self.buffering(),
+        };
+        ctx.data_mut(|d| d.insert_temp(widgets::NowPlaying::id(), np));
         // Now playing is dark; once it's most of the way up, so is the player bar under it.
         let np = theme::anim_bool(&ctx, "np-open", self.np_open && self.current().is_some(), 0.42);
         let light = self.light_pages(&ctx) && np < 0.5 && !self.fullscreen;
@@ -1294,7 +1334,9 @@ impl eframe::App for App {
             dev_screenshot(&ctx, now);
             return;
         }
-        shell::background(self, ui, screen, now, covered.then_some(bar_strip));
+        if !self.fullscreen || np < 1.0 {
+            shell::background(self, ui, screen, now, covered.then_some(bar_strip));
+        }
         if !self.fullscreen && !covered {
             // The top of the window, down to the search box's row: what's on it comes after.
             titlebar::drag_area(ui, egui::Rect::from_min_size(screen.min, egui::vec2(screen.width(), titlebar::HEIGHT)), "main");
@@ -1314,7 +1356,6 @@ impl eframe::App for App {
             let side_margin = egui::Margin { left: inset, right: inset, top: titlebar::top_margin(&ctx, 16, 32.0), bottom: 16 };
             let floating_margin = egui::Margin { left: 12, right: 12, top: (titlebar::content_top(&ctx) - 4.0).max(14.0) as i8, bottom: 14 };
             let side_frame = match app_style.sidebar {
-                SidebarStyle::Glass if theme::macos_default() => egui::Frame::new().fill(theme::sidebar_fill()).inner_margin(side_margin),
                 SidebarStyle::Glass => egui::Frame::new().fill(theme::panel(side_alpha)).inner_margin(side_margin),
                 SidebarStyle::Transparent => egui::Frame::new().inner_margin(side_margin),
                 SidebarStyle::Solid => egui::Frame::new().fill(look.solid()).inner_margin(side_margin),
@@ -1470,6 +1511,8 @@ impl eframe::App for App {
         };
         storage.set_string("repeat", repeat.into());
         let b = |v: bool| if v { "1" } else { "0" }.to_owned();
+        #[cfg(target_os = "macos")]
+        storage.set_string("lock_screen_player", b(self.lock_screen_enabled));
         storage.set_string("autoplay", b(self.autoplay));
         storage.set_string("recent_searches", serde_json::to_string(&self.recent_searches).unwrap_or_default());
         storage.set_string("jam_name", self.jam.name.clone());

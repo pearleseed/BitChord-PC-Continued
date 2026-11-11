@@ -1,6 +1,6 @@
 //! Dolby Atmos out of a DASH manifest: the addon hands over an MPD whose E-AC-3 JOC
-//! rendition is fetched whole, decoded to stereo PCM and wrapped in a WAV, so the
-//! player seeks and mixes it like any other file. Windows has no E-AC-3 decoder of
+//! rendition is fetched whole and decoded to stereo PCM, so the player seeks and
+//! mixes it like any other file. Windows has no E-AC-3 decoder of
 //! its own and symphonia doesn't carry one; filmcraft-ac3 does the decode here.
 
 use std::time::Duration;
@@ -25,9 +25,7 @@ pub struct Audio {
 pub async fn fetch(http: &reqwest::Client, mpd_url: &str) -> anyhow::Result<Audio> {
     let text = http.get(mpd_url).timeout(FETCH_TIMEOUT).header("User-Agent", crate::hires::USER_AGENT).send().await?.error_for_status()?.text().await?;
     let plan = Plan::parse(&text, mpd_url)?;
-    let mut bytes = Vec::new();
-    let init = get(http, &plan.init).await?;
-    bytes.extend_from_slice(&init);
+    let mut bytes = get(http, &plan.init).await?.to_vec();
     let mut stream = futures_util::stream::iter(plan.segments.into_iter().map(|u| {
         let http = http.clone();
         async move { get(&http, &u).await }
@@ -37,19 +35,21 @@ pub async fn fetch(http: &reqwest::Client, mpd_url: &str) -> anyhow::Result<Audi
         anyhow::ensure!(bytes.len() + part.len() <= MAX_BYTES, "the Atmos rendition is too large");
         bytes.extend_from_slice(&part);
     }
-    let (pcm, sample_rate) = tokio::task::spawn_blocking(move || decode(&bytes)).await??;
+    let (pcm, sample_rate) = tokio::task::spawn_blocking(move || {
+        let (mut pcm, sample_rate) = decode(&bytes)?;
+        drop(bytes);
+        // Keep only the final audio bytes for playback.
+        pcm.shrink_to_fit();
+        Ok::<_, anyhow::Error>((pcm, sample_rate))
+    }).await??;
     anyhow::ensure!(!pcm.is_empty(), "the Atmos rendition decoded to nothing");
-    let duration_ms = pcm.len() as u64 / 2 * 1000 / sample_rate as u64;
-    let mut pcm_bytes = Vec::with_capacity(pcm.len() * 2);
-    for s in pcm {
-        pcm_bytes.extend_from_slice(&s.to_le_bytes());
-    }
-    Ok(Audio { pcm: pcm_bytes, sample_rate, duration_ms, bitrate_kbps: plan.bandwidth / 1000 })
+    let duration_ms = pcm.len() as u64 / 4 * 1000 / sample_rate as u64;
+    Ok(Audio { pcm, sample_rate, duration_ms, bitrate_kbps: plan.bandwidth / 1000 })
 }
 
-async fn get(http: &reqwest::Client, url: &str) -> anyhow::Result<Vec<u8>> {
+async fn get(http: &reqwest::Client, url: &str) -> anyhow::Result<bytes::Bytes> {
     let r = http.get(url).timeout(FETCH_TIMEOUT).header("User-Agent", crate::hires::USER_AGENT).send().await?.error_for_status()?;
-    Ok(r.bytes().await?.to_vec())
+    Ok(r.bytes().await?)
 }
 
 /// The rendition's segment addresses, read out of the MPD.
@@ -178,11 +178,11 @@ fn duration_attr(v: Option<&str>) -> Option<u64> {
 }
 
 /// The E-AC-3 syncframes inside the fMP4's mdat boxes, decoded and downmixed to
-/// interleaved stereo i16. Dependent substreams (the JOC objects beyond the 5.1
+/// interleaved little-endian stereo PCM. Dependent substreams (the JOC objects beyond the 5.1
 /// bed) carry no program of their own and are skipped.
-fn decode(bytes: &[u8]) -> anyhow::Result<(Vec<i16>, u32)> {
+fn decode(bytes: &[u8]) -> anyhow::Result<(Vec<u8>, u32)> {
     let mut decoder = Decoder::new();
-    let mut pcm: Vec<i16> = Vec::new();
+    let mut pcm = Vec::new();
     let mut rate = 0u32;
     for payload in mdat_payloads(bytes) {
         let mut i = 0usize;
@@ -244,11 +244,12 @@ fn mdat_payloads(bytes: &[u8]) -> Vec<&[u8]> {
 
 /// The 5.1 bed (WAV order L R C LFE Ls Rs) folded to stereo, centre and surrounds
 /// at -3 dB, LFE left out; smaller layouts keep their front pair.
-fn downmix(channels: &[Vec<f32>], pcm: &mut Vec<i16>) {
+fn downmix(channels: &[Vec<f32>], pcm: &mut Vec<u8>) {
     let n = channels.first().map_or(0, Vec::len);
     let mut push = |l: f32, r: f32| {
-        pcm.push((l.clamp(-1.0, 1.0) * 32767.0) as i16);
-        pcm.push((r.clamp(-1.0, 1.0) * 32767.0) as i16);
+        let [ll, lh] = ((l.clamp(-1.0, 1.0) * 32767.0) as i16).to_le_bytes();
+        let [rl, rh] = ((r.clamp(-1.0, 1.0) * 32767.0) as i16).to_le_bytes();
+        pcm.extend_from_slice(&[ll, lh, rl, rh]);
     };
     const C: f32 = std::f32::consts::FRAC_1_SQRT_2;
     match channels.len() {
@@ -327,6 +328,13 @@ mod tests {
         bytes.extend_from_slice(b"mdat");
         bytes.extend_from_slice(&[1, 2, 3, 4]);
         assert_eq!(mdat_payloads(&bytes), vec![&[1u8, 2, 3, 4][..]]);
+    }
+
+    #[test]
+    fn downmix_writes_interleaved_little_endian_pcm() {
+        let mut pcm = Vec::new();
+        downmix(&[vec![-1.0, 0.5, 2.0], vec![1.0, -0.5, -2.0]], &mut pcm);
+        assert_eq!(pcm, [1, 128, 255, 127, 255, 63, 1, 192, 255, 127, 1, 128]);
     }
 
     #[test]

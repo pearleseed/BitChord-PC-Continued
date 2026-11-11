@@ -12,8 +12,8 @@ use egui::load::{
 };
 use egui::{TextureHandle, TextureOptions, Vec2};
 
-/// GPU memory the thumbnails may keep before the least recently drawn are dropped.
-const TEXTURE_BUDGET: usize = 96 * 1024 * 1024;
+/// Soft GPU budget for artwork. The visible working set is kept even under pressure.
+const TEXTURE_BUDGET: usize = 48 * 1024 * 1024;
 
 struct Texture {
     handle: TextureHandle,
@@ -116,13 +116,22 @@ impl TextureLoader for Textures {
     }
 
     fn end_pass(&self, pass_index: u64) {
-        let mut state = self.state.lock().unwrap();
-        state.pass = pass_index;
-        if state.bytes <= TEXTURE_BUDGET {
+        self.state.lock().unwrap().end_pass(pass_index, TEXTURE_BUDGET);
+    }
+
+    fn byte_size(&self) -> usize {
+        self.state.lock().unwrap().bytes
+    }
+}
+
+impl TextureState {
+    fn end_pass(&mut self, pass_index: u64, budget: usize) {
+        self.pass = pass_index;
+        if self.bytes <= budget {
             return;
         }
         // Oldest first; anything drawn in the last couple of frames stays.
-        let mut old: Vec<_> = state
+        let mut old: Vec<_> = self
             .cache
             .iter()
             .flat_map(|(uri, variants)| {
@@ -134,19 +143,38 @@ impl TextureLoader for Textures {
             .collect();
         old.sort_unstable_by_key(|(last_used, _, _)| *last_used);
         for (_, uri, options) in old {
-            if state.bytes <= TEXTURE_BUDGET * 3 / 4 {
+            if self.bytes <= budget * 3 / 4 {
                 break;
             }
-            let variants = state.cache.get_mut(&uri).expect("queued texture URI");
+            let variants = self.cache.get_mut(&uri).expect("queued texture URI");
             let removed = variants.remove(&options).expect("queued texture variant");
             if variants.is_empty() {
-                state.cache.remove(&uri);
+                self.cache.remove(&uri);
             }
-            state.bytes -= removed.handle.byte_size();
+            self.bytes -= removed.handle.byte_size();
         }
     }
+}
 
-    fn byte_size(&self) -> usize {
-        self.state.lock().unwrap().bytes
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn evicts_old_textures_first_and_keeps_the_visible_working_set() {
+        let ctx = egui::Context::default();
+        let options = TextureOptions::LINEAR;
+        let mut state = TextureState::default();
+        for (name, last_used) in [("old", 0), ("less old", 1), ("visible", 5)] {
+            let handle = ctx.load_texture(name, egui::ColorImage::filled([4, 4], egui::Color32::WHITE), options);
+            state.bytes += handle.byte_size();
+            let texture = Texture { handle, size: Vec2::splat(4.0), last_used };
+            state.cache.insert(name.into(), HashMap::from([(options, texture)]));
+        }
+        state.end_pass(5, 128);
+        assert_eq!(state.bytes, 64);
+        assert!(state.cache.contains_key("visible"));
+        state.end_pass(5, 32);
+        assert_eq!(state.bytes, 64);
     }
 }

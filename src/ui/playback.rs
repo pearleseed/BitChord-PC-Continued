@@ -50,25 +50,25 @@ impl App {
         }
         let Some(l) = self.lyric_choice() else { return };
         let Some((id, _)) = &self.lyrics else { return };
-        let target = self.lyric_prefs.target.clone();
-        let want = (id.clone(), l.provider.key().to_owned(), target.clone());
-        if self.extras_asked.as_ref() == Some(&want) {
+        let target = &self.lyric_prefs.target;
+        let source = l.provider.key();
+        if self.extras_asked.as_ref().is_some_and(|(v, s, lang)| v == id && s == source && lang == target) {
             return;
         }
         let needs = l.lines.iter().any(|x| {
             !x.instrumental
                 && !x.text.trim().is_empty()
                 && ((self.show_roman && x.romanization.is_none() && crate::translate::non_latin(&x.text))
-                    || (self.show_trans && lyric_prefs::shipped_translation(x, &target).is_none()))
+                    || (self.show_trans && lyric_prefs::shipped_translation(x, target).is_none()))
         });
         let req = needs.then(|| Req::LyricsExtras {
             video_id: id.clone(),
-            source: l.provider.key().to_owned(),
+            source: source.to_owned(),
             lines: l.lines.iter().map(|x| if x.instrumental { String::new() } else { x.text.clone() }).collect(),
             lang: l.language.clone(),
-            target,
+            target: target.clone(),
         });
-        self.extras_asked = Some(want);
+        self.extras_asked = Some((id.clone(), source.to_owned(), target.clone()));
         if let Some(r) = req {
             self.backend.request(r);
         }
@@ -279,6 +279,10 @@ impl App {
         }
         log::info!("picking up {} from another device ({} in its queue)", track.id, q.tracks.len());
         self.queue.adopt(q.tracks, q.index);
+        #[cfg(target_os = "macos")]
+        {
+            self.lock_screen_hidden_generation = Some(self.generation);
+        }
         // Not a new play: an old song version mustn't come back with its video.
         self.playing_as = None;
         self.queue_source = None;

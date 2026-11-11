@@ -35,6 +35,10 @@ const HEAD_BLOCKS: usize = 2;
 /// `AHEAD` blocks forward (about 5 minutes at 256 kbps) and `BEHIND` back; the rest is dropped and
 /// fetched again if a seek goes back to it.
 const WINDOWED_FROM: u64 = 40 * 1024 * 1024;
+/// Ordinary addon files can start with one request and keep the bytes for later seeks.
+const SEQUENTIAL_ADDON_MAX: u64 = 128 * 1024 * 1024;
+/// Switch to ranges when a decoder jumps well beyond the sequential download.
+const SEQUENTIAL_SEEK_AHEAD: usize = 8;
 const AHEAD: usize = 40;
 const BEHIND: usize = 8;
 
@@ -216,6 +220,26 @@ impl Shared {
         }
     }
 
+    /// Wait for a few contiguous blocks after the decoder's current read position.
+    pub async fn wait_read_ahead(&self, blocks: usize) -> anyhow::Result<()> {
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            {
+                let inner = self.inner.lock().unwrap();
+                if let Some(error) = inner.error.as_ref() {
+                    anyhow::bail!("{error}");
+                }
+                anyhow::ensure!(!inner.cancelled, "download cancelled");
+                if inner.blocks.iter().skip(inner.want).take(blocks).all(Option::is_some) {
+                    return Ok(());
+                }
+            }
+            changed.await;
+        }
+    }
+
     /// Wait until the download stops, however it ends.
     #[allow(dead_code)]
     pub async fn finished(&self) {
@@ -225,6 +249,11 @@ impl Shared {
     /// Why the download stopped early, if it failed.
     pub fn error(&self) -> Option<String> {
         self.inner.lock().unwrap().error.clone()
+    }
+
+    pub fn flac_quality(&self) -> Option<(u32, u32)> {
+        let inner = self.inner.lock().unwrap();
+        flac_quality(inner.blocks.first()?.as_ref()?)
     }
 
     /// Stop downloading (e.g. a prefetch that was superseded).
@@ -378,13 +407,23 @@ pub async fn download(http: reqwest::Client, url: String, ua: String, shared: Ar
 
 async fn download_stream(http: reqwest::Client, url: String, ua: String, shared: Arc<Shared>, refresh: Option<Refresh>, ranging: Ranging) {
     if ranging == Ranging::Header && shared.total > 0 {
+        let get = || send_request(http.get(&url).header("User-Agent", &ua).header("Accept-Encoding", "identity"));
+        // Addon CDNs may allow one continuous GET but throttle hundreds of small
+        // ranges. Use ranges if the decoder actually jumps ahead or the GET fails.
+        if shared.total <= SEQUENTIAL_ADDON_MAX
+            && let Ok(response) = get().await
+            && response.status() == reqwest::StatusCode::OK
+            && download_whole(response, &shared, true).await
+        {
+            return;
+        }
         // The first request checks range support and carries playable data. If the
         // server ignores Range, keep reading that same response sequentially.
         let (_, end) = shared.range(0);
-        if let Ok(response) = range_response(&http, &url, &ua, 0, end).await {
+        if !shared.has_buffered(1) && let Ok(response) = range_response(&http, &url, &ua, 0, end).await {
             let status = response.status();
             if status == reqwest::StatusCode::OK {
-                download_whole(response, &shared).await;
+                download_whole(response, &shared, false).await;
                 return;
             }
             if status == reqwest::StatusCode::PARTIAL_CONTENT
@@ -394,11 +433,11 @@ async fn download_stream(http: reqwest::Client, url: String, ua: String, shared:
             }
             // Some origins reject Range but will serve an ordinary GET. If it
             // also fails, the range workers still handle retries and URL renewal.
-            if matches!(status, reqwest::StatusCode::BAD_REQUEST | reqwest::StatusCode::FORBIDDEN | reqwest::StatusCode::RANGE_NOT_SATISFIABLE)
-                && let Ok(response) = send_request(http.get(&url).header("User-Agent", &ua).header("Accept-Encoding", "identity")).await
+            if matches!(status, reqwest::StatusCode::BAD_REQUEST | reqwest::StatusCode::FORBIDDEN | reqwest::StatusCode::METHOD_NOT_ALLOWED | reqwest::StatusCode::RANGE_NOT_SATISFIABLE)
+                && let Ok(response) = get().await
                 && response.status() == reqwest::StatusCode::OK
             {
-                download_whole(response, &shared).await;
+                download_whole(response, &shared, false).await;
                 return;
             }
         }
@@ -522,16 +561,26 @@ async fn read_response(mut resp: reqwest::Response, expect: u64) -> anyhow::Resu
     Ok(buf.freeze())
 }
 
-/// One sequential download for a server that won't serve ranges, filling `shared` block
-/// by block as bytes arrive so playback can start before the file is complete.
-async fn download_whole(mut resp: reqwest::Response, shared: &Arc<Shared>) {
+/// Fill `shared` block by block from a continuous response. Return false to let
+/// range workers finish from the blocks already saved.
+async fn download_whole(mut resp: reqwest::Response, shared: &Arc<Shared>, allow_ranges: bool) -> bool {
+    // Sequential responses cannot refill evicted blocks on a later seek.
+    shared.inner.lock().unwrap().windowed = false;
     let stalled = || anyhow::anyhow!("no data for {} s", STALL.as_secs());
     let result = async {
         let block = BLOCK as usize;
         let blocks = shared.inner.lock().unwrap().blocks.len();
         let mut buf = bytes::BytesMut::with_capacity(block);
         let (mut idx, mut received) = (0usize, 0u64);
-        while let Some(chunk) = tokio::time::timeout(STALL, resp.chunk()).await.map_err(|_| stalled())?.map_err(reqwest::Error::without_url)? {
+        loop {
+            if allow_ranges && idx < blocks {
+                wait_for_sequential_slot(shared, idx).await;
+            }
+            let chunk = tokio::select! {
+                _ = wait_for_distant_read(shared, idx), if allow_ranges => return Ok(false),
+                chunk = tokio::time::timeout(STALL, resp.chunk()) => chunk.map_err(|_| stalled())?.map_err(reqwest::Error::without_url)?,
+            };
+            let Some(chunk) = chunk else { break };
             received += chunk.len() as u64;
             anyhow::ensure!(received <= shared.total, "response exceeded {} bytes", shared.total);
             buf.extend_from_slice(&chunk);
@@ -544,11 +593,46 @@ async fn download_whole(mut resp: reqwest::Response, shared: &Arc<Shared>) {
         if idx < blocks {
             shared.put(idx, buf.split().freeze());
         }
-        anyhow::Ok(())
+        anyhow::Ok(true)
     }
     .await;
-    if let Err(e) = result {
-        shared.fail(format!("stream: {e:#}"));
+    match result {
+        Ok(complete) => complete,
+        Err(e) if allow_ranges => {
+            log::debug!("sequential addon audio stopped ({e:#}); trying ranges");
+            false
+        }
+        Err(e) => {
+            shared.fail(format!("stream: {e:#}"));
+            true
+        }
+    }
+}
+
+async fn wait_for_sequential_slot(shared: &Shared, next: usize) {
+    loop {
+        let changed = shared.changed.notified();
+        tokio::pin!(changed);
+        changed.as_mut().enable();
+        if next < shared.inner.lock().unwrap().limit {
+            return;
+        }
+        changed.await;
+    }
+}
+
+async fn wait_for_distant_read(shared: &Shared, next: usize) {
+    loop {
+        let changed = shared.changed.notified();
+        tokio::pin!(changed);
+        changed.as_mut().enable();
+        {
+            let inner = shared.inner.lock().unwrap();
+            if inner.want >= next + SEQUENTIAL_SEEK_AHEAD && inner.blocks[inner.want].is_none() {
+                return;
+            }
+        }
+        changed.await;
     }
 }
 
@@ -601,9 +685,7 @@ impl Read for StreamReader {
             if let Some(w) = inner.wants.iter_mut().find(|(id, _)| *id == self.id) {
                 w.1 = idx;
             }
-            if inner.windowed {
-                self.shared.changed.notify_waiters();
-            }
+            self.shared.changed.notify_waiters();
         }
         while inner.blocks[idx].is_none() {
             if let Some(e) = &inner.error {
@@ -694,7 +776,13 @@ impl Stats {
     pub fn of(shared: &Shared, decoder: &TrackDecoder) -> Self {
         let rate = rodio::Source::sample_rate(decoder).get();
         let channels = rodio::Source::channels(decoder).get();
-        Self::from_parts(&shared.format, shared.info.as_ref(), shared.total, shared.duration_ms, rate, channels)
+        let mut info = shared.info.clone();
+        if let Some(info) = info.as_mut()
+            && let Some((_, depth)) = shared.flac_quality()
+        {
+            info.bit_depth = Some(depth);
+        }
+        Self::from_parts(&shared.format, info.as_ref(), shared.total, shared.duration_ms, rate, channels)
     }
 
     fn from_parts(format: &Format, info: Option<&crate::hires::Info>, size: u64, duration_ms: u64, sample_rate: u32, channels: u16) -> Self {
@@ -711,7 +799,7 @@ impl Stats {
         // Lossless reads as the rate its samples decode to (1,411 kbps for a CD), the
         // figure Tidal, Qobuz and Apple Music print; lossy as the rate its source stated,
         // or else the one the file's size and length make (when the size is known).
-        let measured = (duration_ms > 0 && size != crate::hires::UNKNOWN_SIZE)
+        let measured = (duration_ms > 0 && size > 0)
             .then(|| u32::try_from(u128::from(size) * 8 / u128::from(duration_ms)).ok()).flatten();
         let bitrate_kbps = match bit_depth {
             Some(bits) if info.is_some_and(|i| i.lossless()) => {
@@ -721,6 +809,17 @@ impl Stats {
         };
         Self { codec, bit_depth, sample_rate, channels, bitrate_kbps: bitrate_kbps.filter(|k| *k > 0) }
     }
+}
+
+fn flac_quality(data: &[u8]) -> Option<(u32, u32)> {
+    if data.get(..4)? != b"fLaC" || data.get(4)? & 0x7f != 0 || data.get(5..8)? != [0, 0, 34] {
+        return None;
+    }
+    // RFC 9639 STREAMINFO packs sample rate, channels and bit depth into these four bytes.
+    let packed = u32::from_be_bytes(data.get(18..22)?.try_into().ok()?);
+    let rate = packed >> 12;
+    let depth = ((packed >> 4) & 0x1f) + 1;
+    (rate > 0 && depth >= 4).then_some((rate, depth))
 }
 
 /// A codec under its usual name: Opus and Vorbis as they're written, the rest in capitals.
@@ -793,7 +892,7 @@ impl rodio::Source for TrackDecoder {
 
 /// Interleaved signed 16-bit little-endian PCM read from the stream buffer.
 pub struct PcmSource {
-    reader: StreamReader,
+    reader: io::BufReader<StreamReader>,
     rate: u32,
     channels: u16,
     duration: Option<Duration>,
@@ -802,7 +901,9 @@ pub struct PcmSource {
 impl PcmSource {
     fn new(shared: Arc<Shared>, rate: u32, channels: u16) -> Self {
         let duration_ms = shared.duration_ms;
-        Self { reader: StreamReader::new(shared), rate, channels, duration: (duration_ms > 0).then(|| Duration::from_millis(duration_ms)) }
+        // Amortize the stream lock over many PCM samples.
+        let reader = io::BufReader::new(StreamReader::new(shared));
+        Self { reader, rate, channels, duration: (duration_ms > 0).then(|| Duration::from_millis(duration_ms)) }
     }
 }
 
@@ -833,6 +934,57 @@ impl rodio::Source for PcmSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pcm_reads_across_blocks_and_resumes_at_the_requested_frame() {
+        let samples: Vec<i16> = (0..BLOCK as usize / 2 + 6)
+            .map(|i| (i % 32_749) as i16 - 16_000)
+            .collect();
+        let bytes = samples.iter().flat_map(|sample| sample.to_le_bytes()).collect();
+        let format = Format::Pcm { rate: 1000, channels: 2 };
+        let shared = Shared::from_bytes_with_format(bytes, 0, None, format, None);
+        let mut pcm = decoder(shared, false).unwrap();
+        let sample = |i: i16| Some(i as f32 / 32768.0);
+
+        assert_eq!(pcm.next(), sample(samples[0]));
+        rodio::Source::try_seek(&mut pcm, Duration::from_millis(123)).unwrap();
+        for &expected in &samples[246..] {
+            assert_eq!(pcm.next(), sample(expected));
+        }
+        assert_eq!(pcm.next(), None);
+        rodio::Source::try_seek(&mut pcm, Duration::ZERO).unwrap();
+        assert_eq!(pcm.next(), sample(samples[0]));
+    }
+
+    #[test]
+    fn reads_flac_resolution_from_streaminfo() {
+        let mut header = [0; 42];
+        header[..8].copy_from_slice(b"fLaC\x80\x00\x00\x22");
+        header[18..22].copy_from_slice(&[0x0a, 0xc4, 0x42, 0xf0]);
+        assert_eq!(flac_quality(&header), Some((44_100, 16)));
+        header[18..22].copy_from_slice(&[0x17, 0x70, 0x03, 0x70]);
+        assert_eq!(flac_quality(&header), Some((96_000, 24)));
+        assert_eq!(flac_quality(&header[..20]), None);
+    }
+
+    #[tokio::test]
+    async fn a_far_seek_wakes_the_sequential_download() {
+        let shared = Shared::new(12 * BLOCK, 0, None, Format::Aac, None, true);
+        let jumped = wait_for_distant_read(&shared, 1);
+        tokio::pin!(jumped);
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(jumped.as_mut().poll(&mut cx).is_pending());
+        let copy = shared.clone();
+        let reader = tokio::task::spawn_blocking(move || {
+            let mut reader = StreamReader::new(copy);
+            reader.seek(SeekFrom::Start(10 * BLOCK)).unwrap();
+            reader.read(&mut [0; 1])
+        });
+        let result = tokio::time::timeout(Duration::from_secs(1), jumped).await;
+        shared.cancel();
+        assert!(reader.await.unwrap().is_err());
+        result.expect("the decoder jumped ahead without waking the downloader");
+    }
 
     fn info(codec: &str, bits: Option<u32>, kbps: Option<u32>) -> crate::hires::Info {
         crate::hires::Info {
@@ -866,9 +1018,9 @@ mod tests {
         assert_eq!(Stats::from_parts(&Format::Aac, None, 3_360_000, 210_000, 44_100, 2).codec, "AAC");
         // A length nobody reported leaves the bitrate out rather than guessing.
         assert_eq!(Stats::from_parts(&Format::Aac, None, 3_360_000, 0, 44_100, 2).bitrate_kbps, None);
-        // So does a size that's only the placeholder for one nobody reported.
+        // So does an unknown file size.
         let mp3 = Format::File { hint: "mp3", mime: None };
-        assert_eq!(Stats::from_parts(&mp3, Some(&info("mp3", None, None)), crate::hires::UNKNOWN_SIZE, 210_000, 44_100, 2).bitrate_kbps, None);
+        assert_eq!(Stats::from_parts(&mp3, Some(&info("mp3", None, None)), 0, 210_000, 44_100, 2).bitrate_kbps, None);
     }
 
     #[test]

@@ -17,7 +17,7 @@ pub struct Art {
 }
 
 pub fn process(bytes: &[u8]) -> anyhow::Result<Art> {
-    let img = image::load_from_memory(bytes)?.to_rgb8();
+    let img = image::load_from_memory(bytes)?.into_rgb8();
     let small = image::imageops::resize(&img, SIZE, SIZE, image::imageops::FilterType::Triangle);
 
     let accent = palette(&small);

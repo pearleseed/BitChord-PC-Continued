@@ -345,7 +345,7 @@ enum Align {
 }
 
 struct Layout {
-    key: u64,
+    key: Option<u64>,
     width: f32,
     blocks: Vec<Block>,
     pad_top: f32,
@@ -803,8 +803,6 @@ pub struct Frame<'a> {
     pub lyrics: &'a Lyrics,
     /// Identifies the song, source, decorations and settings the layout depends on.
     pub key: u64,
-    pub roman: Vec<Option<Roman<'a>>>,
-    pub trans: Vec<Option<&'a str>>,
     /// Audible song position (s), already corrected for output latency and the
     /// listener's offsets.
     pub t: f64,
@@ -817,6 +815,8 @@ pub struct Frame<'a> {
     /// The listener's lyrics text size, a multiple of the theme's.
     pub scale: f32,
 }
+
+pub type Decorations<'a> = (Vec<Option<Roman<'a>>>, Vec<Option<&'a str>>);
 
 pub struct Out {
     pub seek: Option<f64>,
@@ -831,12 +831,18 @@ impl View {
         *self = Self { glow: std::mem::take(&mut self.glow), ..Default::default() };
     }
 
-    /// Called every frame: once the view isn't drawn (another tab or page), its glows,
-    /// blurred lines and atlas copy go; they're rebuilt as it comes back.
-    pub fn release_hidden(&mut self, pass: u64) {
-        if self.shown_pass != 0 && self.shown_pass + 1 < pass {
+    /// Release the glows and atlas copy when the view stops drawing, even when the
+    /// native window is hidden and egui's pass counter stops advancing.
+    pub fn release_hidden(&mut self, pass: u64, window_hidden: bool) {
+        if self.shown_pass != 0 && (window_hidden || self.shown_pass + 1 < pass) {
             self.glow = Glow::default();
             self.shown_pass = 0;
+        }
+    }
+
+    pub fn invalidate_layout(&mut self) {
+        if let Some(layout) = &mut self.layout {
+            layout.key = None;
         }
     }
 
@@ -854,15 +860,15 @@ impl View {
         self.glow.blurred_line(ctx, key, blur / 2.0, &[], &[(g, at, 1.0)], &[], 1.0, atlas, ppp)
     }
 
-    pub fn show(&mut self, ui: &mut egui::Ui, f: Frame) -> Out {
+    pub fn show<'a>(&mut self, ui: &mut egui::Ui, f: Frame<'a>, decorations: impl FnOnce() -> Decorations<'a>) -> Out {
         let rect = f.rect;
         let ctx = ui.ctx().clone();
-        self.shown_pass = ctx.cumulative_pass_nr();
         let cfg = Cfg::new(f.style, f.accent, rect.width(), ctx.content_rect().width(), f.centered, f.scale);
-        let layout_key = hash((f.key, rect.width().round() as i32, cfg.size.to_bits(), cfg.padding.to_bits(), cfg.max_scale().to_bits(), cfg.centered, &cfg.font, cfg.weight as u8));
-        if self.layout.as_ref().is_none_or(|l| l.key != layout_key) {
-            self.relayout(ui, &cfg, &f, layout_key, rect);
+        let layout_key = hash((f.key, rect.width().round() as i32, rect.height().round() as i32, cfg.size.to_bits(), cfg.padding.to_bits(), cfg.max_scale().to_bits(), cfg.centered, &cfg.font, cfg.weight as u8));
+        if self.layout.as_ref().and_then(|l| l.key) != Some(layout_key) {
+            self.relayout(ui, &cfg, &f, layout_key, decorations());
         }
+        self.shown_pass = ctx.cumulative_pass_nr();
         let layout = self.layout.as_ref().unwrap();
         let richsync = layout.richsync;
         // Lines that aren't credits.
@@ -1219,7 +1225,12 @@ impl View {
         Out { seek, animating, user_scrolling: user }
     }
 
-    fn relayout(&mut self, ui: &mut egui::Ui, cfg: &Cfg, f: &Frame, key: u64, rect: Rect) {
+    fn relayout(&mut self, ui: &mut egui::Ui, cfg: &Cfg, f: &Frame, key: u64, (roman, trans): Decorations<'_>) {
+        // The same line can now have different text or geometry at the same blur radius.
+        for (slot, ..) in std::mem::take(&mut self.glow.lines).into_values() {
+            self.glow.recycle(slot);
+        }
+        let rect = f.rect;
         let width = rect.width() - cfg.pad.0 - cfg.pad.1;
         let lyrics = f.lyrics;
         let mut blocks: Vec<Block> = ui.ctx().fonts_mut(|fonts| {
@@ -1229,11 +1240,11 @@ impl View {
                 .enumerate()
                 .map(|(i, l)| {
                     let agent = if l.instrumental { nearest_agent(lyrics, i) } else { l.agent.clone() };
-                    let roman = f.roman.get(i).and_then(|r| r.as_ref()).map(|r| match r {
+                    let roman = roman.get(i).and_then(|r| r.as_ref()).map(|r| match r {
                         Roman::Timed(p, t) => Roman::Timed(p, t),
                         Roman::Text(t) => Roman::Text(t),
                     });
-                    let trans = f.trans.get(i).copied().flatten();
+                    let trans = trans.get(i).copied().flatten();
                     build_block(fonts, cfg, l, i, width, roman, trans, agent.as_deref())
                 })
                 .collect()
@@ -1291,7 +1302,7 @@ impl View {
             self.states = vec![LineState::default(); blocks.len()];
             self.shifts = vec![Vec::new(); blocks.len()];
         }
-        self.layout = Some(Layout { key, width, blocks, pad_top, content_h: pad_top + content + pad_bottom, richsync });
+        self.layout = Some(Layout { key: Some(key), width, blocks, pad_top, content_h: pad_top + content + pad_bottom, richsync });
     }
 }
 
@@ -2330,6 +2341,59 @@ pub fn dev_off(what: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lyric_decorations_are_prepared_only_when_layout_changes() {
+        let ctx = egui::Context::default();
+        let mut view = View::default();
+        let lyrics = Lyrics {
+            lines: vec![Line { start: 1000, dur: 2000, text: "A line".into(), ..Default::default() }],
+            sync: Sync::Line,
+            provider: crate::lyrics::Provider::LrclibSynced,
+            language: None,
+            songwriters: Vec::new(),
+        };
+        let mut preparations = 0;
+        for frame in 0..4 {
+            if frame == 2 {
+                view.invalidate_layout();
+            }
+            let mut output = ctx.run_ui(Default::default(), |ui| {
+                let rect = Rect::from_min_size(Pos2::ZERO, vec2(600.0, if frame == 3 { 360.0 } else { 400.0 }));
+                view.show(ui, Frame {
+                    lyrics: &lyrics, key: 7, t: 1.0, playing: false, now: 1.0, rect,
+                    style: &crate::preset::active().lyrics, accent: Color32::WHITE,
+                    centered: true, scale: 1.0,
+                }, || {
+                    preparations += 1;
+                    (Vec::new(), Vec::new())
+                });
+            });
+            output.textures_delta.clear();
+            let blur_key = (7, usize::MAX);
+            if frame == 0 {
+                let image = ColorImage::filled([8, 8], Color32::WHITE);
+                let slot = view.glow.upload(&ctx, None, image, "old decoration");
+                view.glow.lines.insert(blur_key, (slot, (4, 1000, 0), Rect::ZERO, 1.0));
+            } else {
+                assert_eq!(view.glow.lines.contains_key(&blur_key), frame == 1);
+            }
+        }
+        assert_eq!(preparations, 3);
+    }
+
+    #[test]
+    fn hiding_the_native_window_releases_lyric_textures_without_a_new_pass() {
+        let ctx = egui::Context::default();
+        let mut view = View { shown_pass: 10, ..Default::default() };
+        let image = ColorImage::filled([8, 8], Color32::WHITE);
+        let slot = view.glow.upload(&ctx, None, image, "test");
+        view.glow.recycle(slot);
+        view.release_hidden(10, false);
+        assert_eq!(view.glow.spare.len(), 1);
+        view.release_hidden(10, true);
+        assert!(view.glow.spare.is_empty());
+    }
 
     #[test]
     fn slots_are_rewritten_in_place() {

@@ -36,9 +36,19 @@ struct Entry {
     pass: u64,
 }
 
+impl Entry {
+    fn bytes(&self) -> usize {
+        match &self.status {
+            Status::Ready(image) => image.pixels.len() * size_of::<egui::Color32>(),
+            _ => 0,
+        }
+    }
+}
+
 #[derive(Default)]
 struct Cache {
     entries: HashMap<String, Entry>,
+    bytes: usize,
     pass: u64,
 }
 
@@ -48,17 +58,31 @@ impl Cache {
             && matches!(&entry.status, Status::Loading(active) if Arc::ptr_eq(active, token))
         {
             entry.status = status;
+            self.bytes += entry.bytes();
         }
     }
 
     fn bytes(&self) -> usize {
-        self.entries
-            .values()
-            .map(|entry| match &entry.status {
-                Status::Ready(image) => image.pixels.len() * size_of::<egui::Color32>(),
-                _ => 0,
-            })
-            .sum()
+        self.bytes
+    }
+
+    fn forget(&mut self, uri: &str) {
+        if let Some(entry) = self.entries.remove(uri) {
+            self.bytes -= entry.bytes();
+        }
+    }
+
+    fn end_pass(&mut self, pass: u64) {
+        self.pass = pass;
+        if self.entries.len() > MAX_ENTRIES || self.bytes > DECODED_BUDGET {
+            self.entries.retain(|_, entry| {
+                let keep = entry.pass.saturating_add(2) >= pass || matches!(entry.status, Status::Loading(_));
+                if !keep {
+                    self.bytes -= entry.bytes();
+                }
+                keep
+            });
+        }
     }
 }
 
@@ -157,11 +181,13 @@ impl ImageLoader for HttpImages {
     }
 
     fn forget(&self, uri: &str) {
-        self.cache.lock().unwrap().entries.remove(source_uri(uri));
+        self.cache.lock().unwrap().forget(source_uri(uri));
     }
 
     fn forget_all(&self) {
-        self.cache.lock().unwrap().entries.clear();
+        let mut cache = self.cache.lock().unwrap();
+        cache.entries.clear();
+        cache.bytes = 0;
     }
 
     fn byte_size(&self) -> usize {
@@ -173,13 +199,7 @@ impl ImageLoader for HttpImages {
     }
 
     fn end_pass(&self, pass: u64) {
-        let mut cache = self.cache.lock().unwrap();
-        cache.pass = pass;
-        if cache.entries.len() > MAX_ENTRIES || cache.bytes() > DECODED_BUDGET {
-            cache.entries.retain(|_, entry| {
-                entry.pass.saturating_add(2) >= pass || matches!(entry.status, Status::Loading(_))
-            });
-        }
+        self.cache.lock().unwrap().end_pass(pass);
     }
 }
 
@@ -336,6 +356,29 @@ impl DiskCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cache_bytes_follow_completion_and_eviction() {
+        let mut cache = Cache::default();
+        let token = Arc::new(());
+        for uri in ["old", "recent"] {
+            cache.entries.insert(
+                uri.into(),
+                Entry { status: Status::Loading(token.clone()), pass: if uri == "old" { 0 } else { 4 } },
+            );
+            cache.finish(
+                uri,
+                &token,
+                Status::Ready(Arc::new(ColorImage::filled([2048, 2048], egui::Color32::BLACK))),
+            );
+        }
+        assert_eq!(cache.bytes(), 32 * 1024 * 1024);
+        cache.end_pass(4);
+        assert_eq!(cache.bytes(), 16 * 1024 * 1024);
+        assert!(!cache.entries.contains_key("old"));
+        cache.forget("recent");
+        assert_eq!(cache.bytes(), 0);
+    }
 
     #[test]
     fn stale_completion_does_not_replace_new_request() {

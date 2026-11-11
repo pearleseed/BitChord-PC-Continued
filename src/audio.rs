@@ -221,6 +221,7 @@ const FX_MAX_FRAMES: usize = 48_000;
 
 struct MixFx {
     ring: Vec<f32>,
+    frames: usize,
     channels: usize,
     frame: usize,
     channel: usize,
@@ -247,6 +248,7 @@ impl MixFx {
         let frames = ((rate as usize * 3) / 4).clamp(2, FX_MAX_FRAMES);
         Some(Self {
             ring: vec![0.0; frames * channels as usize],
+            frames,
             channels: channels as usize,
             frame: 0,
             channel: 0,
@@ -269,7 +271,7 @@ impl MixFx {
     fn begin(&mut self, bpm: f32) {
         self.rhythmic = (70.0..=180.0).contains(&bpm);
         self.beat = self.rate * if self.rhythmic { 60.0 / bpm } else { 0.5 };
-        while self.beat > (self.ring.len() / self.channels - 1) as f32 {
+        while self.beat > (self.frames - 1) as f32 {
             self.beat *= 0.5;
         }
         self.beat = self.beat.max(1.0);
@@ -277,12 +279,15 @@ impl MixFx {
     }
 
     fn tap(&self, delay: f32) -> f32 {
-        let frames = self.ring.len() / self.channels;
-        let delay = delay.clamp(1.0, (frames - 1) as f32);
+        let delay = delay.clamp(1.0, (self.frames - 1) as f32);
         let whole = delay as usize;
         let frac = delay - whole as f32;
-        let a = (self.frame + frames - whole) % frames;
-        let b = (a + frames - 1) % frames;
+        let a = if self.frame >= whole {
+            self.frame - whole
+        } else {
+            self.frame + self.frames - whole
+        };
+        let b = if a == 0 { self.frames - 1 } else { a - 1 };
         self.ring[a * self.channels + self.channel] * (1.0 - frac) + self.ring[b * self.channels + self.channel] * frac
     }
 
@@ -328,7 +333,10 @@ impl MixFx {
         self.channel += 1;
         if self.channel == self.channels {
             self.channel = 0;
-            self.frame = (self.frame + 1) % (self.ring.len() / self.channels);
+            self.frame += 1;
+            if self.frame == self.frames {
+                self.frame = 0;
+            }
             self.ticks += 1;
         }
         result
@@ -1043,6 +1051,8 @@ fn run(
                     player.play();
                 }
                 offset = at;
+                status.set_position(at.as_millis() as u64);
+                wake();
             }
             Ok(AudioCmd::SeekFailed { generation, seek }) => {
                 if generation == current && seek == seek_seq {
@@ -1196,6 +1206,7 @@ fn run(
                     log::debug!("audio: seek to {pos:?} in place");
                     offset = Duration::ZERO;
                     status.set_position(pos.as_millis() as u64);
+                    wake();
                     continue;
                 }
                 // The playing decoder was opened non-seekable for a fast start. Build a
@@ -1433,6 +1444,20 @@ mod tests {
         // The beat repeat brings the impulse back a half beat later (12,000 frames).
         let echo: f32 = out[11_950..12_060].iter().map(|x| x.abs()).sum();
         assert!(echo > 0.01, "no half-beat repeat: {echo}");
+    }
+
+    #[test]
+    fn transition_taps_interpolate_across_the_ring_boundary() {
+        let mut fx = MixFx::new(8, 2).unwrap();
+        for i in 0..8 {
+            fx.process(i as f32, None);
+            fx.process(-(i as f32), None);
+        }
+        assert_eq!(fx.tap(1.0), 7.0);
+        assert_eq!(fx.tap(2.5), 5.5);
+        assert_eq!(fx.tap(3.0), 5.0);
+        fx.process(8.0, None);
+        assert_eq!(fx.tap(2.5), -5.5);
     }
 
     #[test]

@@ -54,6 +54,14 @@ pub(crate) fn run() -> eframe::Result {
     // Dev hook: YTM_BACKGROUND opens the window off-screen, unfocused and off the
     // taskbar, so automated test runs don't pop up over whatever the user is doing.
     let background = std::env::var_os("YTM_BACKGROUND").is_some();
+    // eframe also uses the viewport icon to set the macOS Dock icon at runtime.
+    #[cfg(target_os = "macos")]
+    let icon = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon/macos.png"))
+        .expect("bundled macOS icon is a valid PNG");
+    #[cfg(not(target_os = "macos"))]
+    let icon = appicon::get(appicon::load(&storage_dir))
+        .icon_data()
+        .expect("bundled icons are valid PNGs");
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("BitChord")
         .with_app_id("bitchord")
@@ -61,11 +69,7 @@ pub(crate) fn run() -> eframe::Result {
         .with_min_inner_size(MIN_SIZE)
         // Windows: the app draws its own title bar (see `ui::titlebar`).
         .with_decorations(!ui::custom_titlebar())
-        .with_icon(
-            appicon::get(appicon::load(&storage_dir))
-                .icon_data()
-                .expect("bundled icons are valid PNGs"),
-        );
+        .with_icon(icon);
     #[cfg(target_os = "macos")]
     {
         viewport = viewport

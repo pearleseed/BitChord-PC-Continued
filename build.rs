@@ -10,10 +10,12 @@ fn main() {
     }
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
         println!("cargo:rerun-if-changed=macos/window_chrome.m");
+        println!("cargo:rerun-if-changed=macos/lock_screen.m");
         println!("cargo:rustc-link-lib=framework=AppKit");
+        println!("cargo:rustc-link-lib=framework=CoreGraphics");
         println!("cargo:rustc-link-lib=framework=CoreText");
         cc::Build::new()
-            .file("macos/window_chrome.m")
+            .files(["macos/window_chrome.m", "macos/lock_screen.m"])
             .flag("-fobjc-arc")
             .compile("bitchord_window_chrome");
     }

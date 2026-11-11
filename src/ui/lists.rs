@@ -2,7 +2,9 @@
 //! the edits made here that YouTube Music doesn't list yet. Only the state: the app
 //! sends the requests these ask for and shows the pages.
 
+use std::cell::{OnceCell, RefCell};
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::backend::Collection;
@@ -26,6 +28,44 @@ pub struct Opened {
     pub load: u64,
     /// When that load came in.
     at: Instant,
+    duration: OnceCell<u64>,
+    search: RefCell<Option<ListSearch>>,
+}
+
+struct ListSearch {
+    query: String,
+    rows: Arc<[usize]>,
+}
+
+impl Opened {
+    pub fn duration(&self) -> u64 {
+        *self.duration.get_or_init(|| self.c.tracks.iter().filter_map(|t| t.duration).map(u64::from).sum())
+    }
+
+    pub fn matching_rows(&self, query: &str) -> Option<Arc<[usize]>> {
+        let query = query.trim();
+        if query.is_empty() {
+            return None;
+        }
+        let mut search = self.search.borrow_mut();
+        if let Some(found) = search.as_ref().filter(|found| found.query == query) {
+            return Some(found.rows.clone());
+        }
+        let needle = query.to_lowercase();
+        let rows: Arc<[usize]> = self.c.tracks.iter().enumerate().filter_map(|(i, t)| {
+            (t.title.to_lowercase().contains(&needle)
+                || t.artist_line().to_lowercase().contains(&needle)
+                || t.album.as_ref().is_some_and(|a| a.name.to_lowercase().contains(&needle)))
+                .then_some(i)
+        }).collect();
+        *search = Some(ListSearch { query: query.to_owned(), rows: rows.clone() });
+        Some(rows)
+    }
+
+    fn invalidate_track_cache(&mut self) {
+        self.duration.take();
+        *self.search.get_mut() = None;
+    }
 }
 
 /// An album or playlist load under way (one each at a time). A playlist not kept yet
@@ -94,7 +134,9 @@ impl Lists {
     }
 
     pub fn collection_mut(&mut self, id: &str) -> Option<&mut Collection> {
-        self.opened.iter_mut().find(|o| o.c.id == id).map(|o| &mut o.c)
+        let opened = self.opened.iter_mut().find(|o| o.c.id == id)?;
+        opened.invalidate_track_cache();
+        Some(&mut opened.c)
     }
 
     /// A load of it is under way.
@@ -152,10 +194,10 @@ impl Lists {
         self.edits.correct_collection(&mut c);
         let id = c.id.clone();
         log::debug!("list {id}: load {load} in, {sent} songs sent, {} after local edits, more={more}", c.tracks.len());
-        let at = Instant::now();
+        let opened = Opened { c, load, at: Instant::now(), duration: OnceCell::new(), search: RefCell::new(None) };
         match self.opened.iter_mut().find(|o| o.c.id == id) {
-            Some(o) => *o = Opened { c, load, at },
-            None => self.opened.insert(0, Opened { c, load, at }),
+            Some(o) => *o = opened,
+            None => self.opened.insert(0, opened),
         }
         self.trim(keep);
         if more {
@@ -179,6 +221,9 @@ impl Lists {
                 // Liked Music has each song once; one liked here meanwhile is at its top already.
                 if id == LIKED_MUSIC {
                     (tracks, set_ids) = tracks.into_iter().zip(set_ids).filter(|(t, _)| !o.c.tracks.iter().any(|x| x.id == t.id)).unzip();
+                }
+                if !tracks.is_empty() {
+                    o.invalidate_track_cache();
                 }
                 o.c.tracks.extend(tracks.iter().cloned());
                 o.c.set_ids.extend(set_ids);
@@ -398,6 +443,34 @@ mod tests {
 
     fn page_of(songs: &[&str]) -> (Vec<Track>, Vec<Option<String>>) {
         (songs.iter().map(|s| track(s)).collect(), songs.iter().map(|s| Some(format!("set-{s}"))).collect())
+    }
+
+    #[test]
+    fn playlist_search_and_duration_follow_pages_and_removals() {
+        let mut lists = Lists::default();
+        let start = lists.load("PL", false, false).unwrap();
+        let mut first = collection("PL", &["skip", "Đêm"]);
+        first.tracks[1].duration = Some(60);
+        lists.arrived(start.load, first, true, &[]).unwrap();
+
+        let opened = lists.get("PL").unwrap();
+        let matches = opened.matching_rows("  ĐÊM  ").unwrap();
+        assert_eq!(&*matches, &[1]);
+        assert!(std::sync::Arc::ptr_eq(&matches, &opened.matching_rows("  ĐÊM  ").unwrap()));
+        assert_eq!(opened.duration(), 60);
+
+        let (mut next, set_ids) = page_of(&["Một đêm"]);
+        next[0].duration = Some(120);
+        lists.page("PL", start.load, next, set_ids, false, &[]).unwrap();
+        let opened = lists.get("PL").unwrap();
+        assert_eq!(&*opened.matching_rows("  ĐÊM  ").unwrap(), &[1, 2]);
+        assert_eq!(opened.duration(), 180);
+
+        lists.collection_mut("PL").unwrap().remove_rows(&[1]);
+        let opened = lists.get("PL").unwrap();
+        assert_eq!(&*opened.matching_rows("  ĐÊM  ").unwrap(), &[1]);
+        assert_eq!(opened.duration(), 120);
+        assert!(opened.matching_rows("  ").is_none());
     }
 
     #[test]

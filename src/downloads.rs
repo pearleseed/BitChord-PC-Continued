@@ -9,11 +9,14 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex, RwLock};
+use std::time::{Duration, Instant, SystemTime};
 
 use serde::{Deserialize, Serialize};
 
 use crate::model::Track;
 use crate::stream::{Format, Shared};
+
+const LIST_REFRESH: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Serialize, Deserialize)]
 struct Entry {
@@ -43,10 +46,47 @@ struct State {
     /// Where the index is saved (the data dir's downloads.json).
     file: PathBuf,
     folder: PathBuf,
+    listed: Mutex<Option<DownloadList>>,
+}
+
+struct DownloadList {
+    checked_at: Instant,
+    tracks: Arc<[Track]>,
+}
+
+impl State {
+    fn list(&self, now: Instant) -> (Arc<[Track]>, Option<Duration>) {
+        let mut listed = self.listed.lock().unwrap();
+        // Detect files changed outside BitChord without hitting the disk on every frame.
+        if let Some(snapshot) = listed.as_ref()
+            && let age = now.duration_since(snapshot.checked_at)
+            && age < LIST_REFRESH
+        {
+            return (snapshot.tracks.clone(), Some(LIST_REFRESH - age));
+        }
+        let mut present: Vec<_> = self
+            .index
+            .values()
+            .filter_map(|entry| {
+                let track = entry.song.as_ref()?;
+                let metadata = std::fs::metadata(&entry.path).ok()?;
+                metadata.is_file().then(|| (metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH), track))
+            })
+            .collect();
+        present.sort_by(|a, b| b.0.cmp(&a.0));
+        let tracks: Arc<[Track]> = present.into_iter().map(|(_, t)| t.clone()).collect();
+        *listed = Some(DownloadList { checked_at: now, tracks: tracks.clone() });
+        (tracks, None)
+    }
+
+    fn set_index(&mut self, index: HashMap<String, Entry>) {
+        self.index = index;
+        *self.listed.get_mut().unwrap() = None;
+    }
 }
 
 static STATE: LazyLock<RwLock<State>> =
-    LazyLock::new(|| RwLock::new(State { index: HashMap::new(), file: PathBuf::new(), folder: default_folder() }));
+    LazyLock::new(|| RwLock::new(State { index: HashMap::new(), file: PathBuf::new(), folder: default_folder(), listed: Default::default() }));
 
 /// Music\BitChord.
 pub fn default_folder() -> PathBuf {
@@ -72,7 +112,7 @@ pub fn init(data_dir: &Path, folder: &str) {
         }
     };
     let mut st = STATE.write().unwrap();
-    st.index = index;
+    st.set_index(index);
     st.file = file;
     st.folder = if folder.is_empty() { default_folder() } else { PathBuf::from(folder) };
 }
@@ -140,19 +180,14 @@ pub fn path(video_id: &str) -> Option<PathBuf> {
 }
 
 /// The downloaded songs still on disk, newest first.
-pub fn list() -> Vec<Track> {
-    let st = STATE.read().unwrap();
-    let mut out: Vec<(std::time::SystemTime, Track)> = st
-        .index
-        .values()
-        .filter(|e| e.path.is_file())
-        .filter_map(|e| {
-            let modified = std::fs::metadata(&e.path).and_then(|m| m.modified()).unwrap_or(std::time::UNIX_EPOCH);
-            e.song.clone().map(|t| (modified, t))
-        })
-        .collect();
-    out.sort_by(|a, b| b.0.cmp(&a.0));
-    out.into_iter().map(|(_, t)| t).collect()
+pub fn list(ctx: &egui::Context) -> Arc<[Track]> {
+    let (tracks, expires_in) = STATE.read().unwrap().list(Instant::now());
+    // A repaint that reused the snapshot may have missed an external file change.
+    // A fresh scan does not schedule another repaint.
+    if let Some(delay) = expires_in {
+        ctx.request_repaint_after(delay);
+    }
+    tracks
 }
 
 /// The downloaded song version of the music video `video_id`, if its file is still there.
@@ -223,7 +258,7 @@ pub fn save(t: &Track, mut audio: Vec<u8>, duration_ms: u64, loudness_db: Option
         }
         return Err(error.into());
     }
-    STATE.write().unwrap().index = index;
+    STATE.write().unwrap().set_index(index);
     Ok(path)
 }
 
@@ -272,6 +307,39 @@ fn tag(path: &Path, t: &Track, cover: Option<Vec<u8>>) -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use crate::model::Link;
+
+    #[test]
+    fn download_list_reuses_the_snapshot_and_refreshes_external_deletions() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("song.m4a");
+        std::fs::write(&path, b"audio").unwrap();
+        let song: Track = serde_json::from_value(serde_json::json!({
+            "id": "song", "title": "Song", "artists": [], "thumbs": []
+        })).unwrap();
+        let mut state = State {
+            index: HashMap::from([("song".into(), Entry {
+                path: path.clone(), duration_ms: 0, loudness_db: None,
+                stands_for: None, song: Some(song),
+            })]),
+            file: PathBuf::new(),
+            folder: dir.path().to_owned(),
+            listed: Default::default(),
+        };
+        let now = Instant::now();
+        let (first, refresh) = state.list(now);
+        assert_eq!(first[0].id, "song");
+        assert_eq!(refresh, None);
+        std::fs::remove_file(path).unwrap();
+        let (cached, refresh) = state.list(now + Duration::from_millis(250));
+        assert!(Arc::ptr_eq(&first, &cached));
+        assert_eq!(refresh, Some(Duration::from_millis(750)));
+        let (expired, refresh) = state.list(now + LIST_REFRESH);
+        assert!(expired.is_empty());
+        assert_eq!(refresh, None);
+        std::fs::write(&state.index["song"].path, b"audio").unwrap();
+        state.set_index(state.index.clone());
+        assert_eq!(state.list(now + LIST_REFRESH).0[0].id, "song");
+    }
 
     #[test]
     fn old_download_index_reopens_webm_as_opus() {

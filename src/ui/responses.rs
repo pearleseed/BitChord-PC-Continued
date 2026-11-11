@@ -13,6 +13,20 @@ use crate::ytm::HomePage;
 use super::{Action, App, Dialog, HomeState, LibTab, MixFrom, Page, PlayingAs, Repeat, dev_var, shuffle};
 
 impl App {
+    pub(super) fn apply_media_event(&mut self, event: MediaControlEvent) {
+        match event {
+            MediaControlEvent::Play | MediaControlEvent::Pause if self.jam.guest() => self.toggle(),
+            MediaControlEvent::Play if self.resume_at.is_some() => self.toggle(),
+            MediaControlEvent::Play => self.audio.send(AudioCmd::Resume),
+            MediaControlEvent::Pause | MediaControlEvent::Stop if self.buffering() && !self.audio.status.started(self.generation) => self.cancel_loading(),
+            MediaControlEvent::Pause | MediaControlEvent::Stop => self.audio.send(AudioCmd::Pause),
+            MediaControlEvent::Toggle => self.toggle(),
+            MediaControlEvent::Next => self.next(),
+            MediaControlEvent::Previous => self.prev(),
+            _ => {}
+        }
+    }
+
     pub(super) fn pump(&mut self, now: f64) {
         let cover = self.media_cover.lock().unwrap().take();
         // The listed track's art, with what plays's title, artists and length.
@@ -28,6 +42,12 @@ impl App {
             self.on_resp(r, now);
         }
         while let Ok(ev) = self.ch.audio_rx.try_recv() {
+            #[cfg(target_os = "macos")]
+            if let AudioEvent::Finished { generation } = &ev
+                && *generation == self.generation
+            {
+                self.lock_screen_hidden_generation = Some(*generation);
+            }
             match ev {
                 AudioEvent::Finished { generation } if generation == self.generation && self.jam.guest() => {}
                 AudioEvent::Finished { generation } if generation == self.generation => {
@@ -84,17 +104,7 @@ impl App {
             self.mix_from = None;
         }
         while let Ok(ev) = self.ch.media_rx.try_recv() {
-            match ev {
-                MediaControlEvent::Play | MediaControlEvent::Pause if self.jam.guest() => self.toggle(),
-                MediaControlEvent::Play if self.resume_at.is_some() => self.toggle(),
-                MediaControlEvent::Play => self.audio.send(AudioCmd::Resume),
-                MediaControlEvent::Pause | MediaControlEvent::Stop if self.buffering() && !self.audio.status.started(self.generation) => self.cancel_loading(),
-                MediaControlEvent::Pause | MediaControlEvent::Stop => self.audio.send(AudioCmd::Pause),
-                MediaControlEvent::Toggle => self.toggle(),
-                MediaControlEvent::Next => self.next(),
-                MediaControlEvent::Previous => self.prev(),
-                _ => {}
-            }
+            self.apply_media_event(ev);
         }
         if self.buffering() && self.audio.status.started(self.generation) {
             self.play_load = None;
@@ -309,6 +319,7 @@ impl App {
                         missing.join(", ")
                     );
                     self.lyrics = Some((video_id, lyrics));
+                    self.lyric_view.invalidate_layout();
                 }
             }
             Resp::Segments { video_id, segments } => {
@@ -320,6 +331,7 @@ impl App {
             Resp::LyricsExtras { video_id, source, target, extras } => {
                 if self.shown().is_some_and(|t| t.id == video_id) {
                     self.lyrics_extras = Some((video_id, source, target, extras));
+                    self.lyric_view.invalidate_layout();
                 }
             }
             Resp::Art { key, art } => {
@@ -492,6 +504,11 @@ impl App {
             Resp::UpgradingQuality { generation, active } => {
                 if generation == self.generation {
                     self.upgrading_quality = active;
+                }
+            }
+            Resp::QualityUnavailable { generation } => {
+                if generation == self.generation {
+                    self.toast("No playable higher-quality copy found in your hi-res sources");
                 }
             }
             Resp::StreamStats { generation, stats } => {

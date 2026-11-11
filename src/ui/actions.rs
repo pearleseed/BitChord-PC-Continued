@@ -221,8 +221,7 @@ impl App {
                 if let Some(listed) = listed.filter(|l| l != &id) {
                     self.backend.upgrade_quality(&listed);
                 }
-                if self.audio_info.is_none()
-                    && self.resume_at.is_none()
+                if self.resume_at.is_none()
                     && let Some(track) = self.playing_track().cloned()
                     && self.backend.try_upgrade_active(self.generation, track)
                 {

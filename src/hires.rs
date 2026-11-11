@@ -9,6 +9,8 @@ use std::collections::{BTreeSet, HashMap};
 use std::time::Duration;
 
 use serde_json::Value;
+use futures_util::stream::{FuturesUnordered, StreamExt};
+use unicode_normalization::{UnicodeNormalization, char::is_combining_mark};
 
 use crate::stream::Format;
 
@@ -17,10 +19,12 @@ pub const USER_AGENT: &str = concat!("BitChord/v", env!("CARGO_PKG_VERSION"));
 const TIER: &str = "LOSSLESS";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+const RENDITION_TIMEOUT: Duration = Duration::from_secs(12);
 /// How many of the search's candidates get a `/stream` call before giving up.
 const STREAM_TRIES: usize = 3;
-/// The size given a stream whose addon and server don't say how big it is.
-pub const UNKNOWN_SIZE: u64 = 512 * 1024 * 1024;
+/// Unknown-length files must finish downloading before a seekable buffer can open.
+const MAX_UNSIZED_BYTES: usize = 128 * 1024 * 1024;
+const SEARCH_TTL: Duration = Duration::from_secs(600);
 
 /// What the player says about the stream it is playing.
 #[derive(Clone, Debug, PartialEq)]
@@ -45,12 +49,19 @@ pub struct Info {
 
 impl Info {
     pub fn lossless(&self) -> bool {
-        matches!(self.codec.to_ascii_lowercase().as_str(), "flac" | "alac" | "wav" | "aiff") || has_lossless_word(&self.quality)
+        matches!(self.codec.to_ascii_lowercase().as_str(), "flac" | "alac" | "wav" | "aiff")
     }
 
     /// More than CD: better than 48 kHz or more than 16 bits.
     pub fn hires(&self) -> bool {
-        self.lossless() && (self.sample_rate.is_some_and(|r| r > 48_000) || self.bit_depth.is_some_and(|b| b > 16))
+        self.lossless() && (self.sample_rate.is_some_and(|r| r > 48_000)
+            || self.bit_depth.is_some_and(|b| b > 16)
+            || (self.bit_depth.is_none() && has_hires_word(&self.quality)))
+    }
+
+    pub fn preference(&self, prefer_atmos: bool) -> (bool, bool, bool, u32, u32, u32) {
+        (prefer_atmos && self.atmos, self.hires(), self.lossless(), self.bit_depth.unwrap_or(0),
+            self.sample_rate.unwrap_or(0), self.bitrate_kbps.unwrap_or(0))
     }
 
     /// The quality mark's text, worded as Apple Music words it.
@@ -76,7 +87,7 @@ pub struct Stream {
     pub duration_ms: u64,
     pub format: Format,
     pub info: Info,
-    /// Already-decoded audio (Dolby Atmos out of DASH): no download to run.
+    /// Audio already in memory, such as decoded Atmos or a file with no length header.
     pub data: Option<Vec<u8>>,
 }
 
@@ -84,13 +95,15 @@ pub struct Stream {
 pub struct Client {
     base: String,
     manifest: tokio::sync::Mutex<Option<Manifest>>,
-    searches: tokio::sync::Mutex<HashMap<String, Vec<Candidate>>>,
+    searches: tokio::sync::Mutex<HashMap<String, (std::time::Instant, Vec<Candidate>)>>,
 }
 
+#[derive(Clone)]
 struct Manifest {
     name: Option<String>,
     defaults: Vec<(String, String)>,
     quality: String,
+    requires_auth: bool,
 }
 
 #[derive(Clone)]
@@ -121,62 +134,87 @@ impl Client {
         host_of(&self.base)
     }
 
-    /// The addon's copy of `track`, already probed for its size. `None`: a miss (which is
-    /// not a fault), so the caller plays it from YouTube. `atmos`: prefer a Dolby Atmos
-    /// rendition when the addon offers one, but still accept lossless/hi-res copies.
-    pub async fn find(&self, http: &reqwest::Client, track: &crate::model::Track, atmos: bool) -> anyhow::Result<Option<Stream>> {
+    /// Prepare the best-matching rows from this addon. The callback publishes each
+    /// playable answer immediately so a stalled rendition can't hide the others.
+    pub async fn find<F>(
+        self: &std::sync::Arc<Self>, http: &reqwest::Client, track: &crate::model::Track,
+        atmos: bool, fresh: bool, prepare: impl Fn(Stream, crate::stream::Refresh) -> F,
+    ) -> anyhow::Result<bool>
+    where
+        F: std::future::Future<Output = anyhow::Result<()>>,
+    {
         let manifest = self.manifest(http).await?;
-        let artist = track.artists.first().map(|a| a.name.clone()).unwrap_or_else(|| track.artist_line());
-        let title = track.title.clone();
+        anyhow::ensure!(!manifest.requires_auth, "the addon requires official BitChord device authentication");
+        let title = &track.title;
+        let artist = track.artists.first().map_or("", |a| a.name.as_str());
         let mut queries = Vec::new();
-        let searchable = searchable_title(&title, &artist);
-        let primary = primary_artist(&artist);
+        let searchable = searchable_title(title, artist);
+        let primary = primary_artist(artist);
         if !searchable.is_empty() {
             queries.push(if primary.is_empty() { searchable.clone() } else { format!("{searchable} {primary}") });
             if !primary.is_empty() && queries.first().is_none_or(|q| q != &searchable) {
                 queries.push(searchable);
             }
         }
-        // When Atmos is preferred, try Atmos-aware results first, then fall back to a
-        // normal lossless lookup so non-Atmos hi-res/lossless still works.
-        let passes: &[(bool, bool)] = if atmos { &[(true, true), (false, false)] } else { &[(false, false)] };
-        let mut tried: BTreeSet<String> = BTreeSet::new();
+        let raw = title.trim().to_lowercase();
+        if !raw.is_empty() && !queries.contains(&raw) {
+            queries.push(raw);
+        }
+        let mut tried = BTreeSet::new();
         let mut last_err = None;
-        for &(search_atmos, prefer_atmos) in passes {
-            for query in &queries {
-                let candidates = match self.search(http, &manifest, query, search_atmos).await {
-                    Ok(c) => c,
-                    Err(e) => { last_err = Some(e); continue; }
-                };
-                let ranked = rank(candidates, &title, &artist, track.duration, prefer_atmos);
-                for candidate in ranked.into_iter().filter(|c| tried.insert(c.id.clone())).take(STREAM_TRIES) {
-                    // Ask for the Atmos rendition only in the Atmos-preferred pass for
-                    // candidates that are actually Atmos; otherwise request normally so
-                    // lossless/hi-res copies resolve.
-                    let stream_atmos = prefer_atmos && candidate.atmos;
-                    match self.stream(http, &manifest, &candidate, stream_atmos).await {
-                        Ok(Some(s)) => return Ok(Some(s)),
-                        Ok(None) => {}
-                        Err(e) => {
-                            log::info!("hi-res: \"{}\" candidate {} skipped: {e:#}", track.title, candidate.id);
-                            last_err = Some(e);
-                        }
+        for query in &queries {
+            let candidates = match self.search(http, &manifest, query, atmos, fresh).await {
+                Ok(c) => c,
+                Err(e) => { last_err = Some(e); continue; }
+            };
+            let mut attempts = FuturesUnordered::new();
+            let manifest = &manifest;
+            let prepare = &prepare;
+            for candidate in rank(candidates, title, artist, track.duration, atmos).into_iter()
+                .filter(|c| tried.insert(c.id.clone()))
+                .take(STREAM_TRIES)
+            {
+                attempts.push(tokio::time::timeout(RENDITION_TIMEOUT, async move {
+                    let stream = self.stream(http, manifest, &candidate, atmos).await?;
+                    let (size, format) = (stream.size, stream.format.clone());
+                    let (client, manifest) = (self.clone(), manifest.clone());
+                    let refresh: crate::stream::Refresh = std::sync::Arc::new(move || {
+                        let (client, manifest, candidate, format) = (client.clone(), manifest.clone(), candidate.clone(), format.clone());
+                        Box::pin(async move {
+                            let stream = client.stream(&crate::proxy::http(), &manifest, &candidate, atmos).await?;
+                            anyhow::ensure!(stream.size == size && stream.format == format, "the addon rendition changed");
+                            Ok(stream.url)
+                        })
+                    });
+                    prepare(stream, refresh).await
+                }));
+            }
+            let mut found = false;
+            while let Some(result) = attempts.next().await {
+                match result.unwrap_or_else(|_| Err(anyhow::anyhow!("addon rendition took too long to prepare"))) {
+                    Ok(()) => found = true,
+                    Err(e) => {
+                        log::debug!("hi-res {}: candidate for \"{title}\" skipped: {e:#}", self.host());
+                        last_err = Some(e);
                     }
                 }
             }
+            if found {
+                return Ok(true);
+            }
         }
-        if let (true, Some(e)) = (tried.is_empty(), last_err) {
+        if let Some(e) = last_err {
             return Err(e);
         }
-        Ok(None)
+        Ok(false)
     }
 
     async fn manifest(&self, http: &reqwest::Client) -> anyhow::Result<Manifest> {
         let mut slot = self.manifest.lock().await;
         if let Some(m) = slot.as_ref() {
-            return Ok(Manifest { name: m.name.clone(), defaults: m.defaults.clone(), quality: m.quality.clone() });
+            return Ok(m.clone());
         }
-        let url = format!("{}/manifest.json", self.base);
+        let url = self.endpoint(&["manifest.json"], &[])?;
         let json = get_json(http, &url).await?;
         let id = json.get("id").and_then(Value::as_str).unwrap_or("").trim();
         anyhow::ensure!(!id.is_empty(), "that URL answered, but not with an addon manifest");
@@ -184,40 +222,39 @@ impl Client {
         anyhow::ensure!(resources.is_empty() || resources.iter().any(|r| r.eq_ignore_ascii_case("search")), "the addon doesn't offer search");
         let name = json.get("name").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned);
         let (defaults, quality) = settings(json.get("settings"));
-        let manifest = Manifest { name, defaults, quality };
-        *slot = Some(Manifest { name: manifest.name.clone(), defaults: manifest.defaults.clone(), quality: manifest.quality.clone() });
+        let requires_auth = json.get("bitchordAuth").and_then(Value::as_bool) == Some(true);
+        let manifest = Manifest { name, defaults, quality, requires_auth };
+        *slot = Some(manifest.clone());
         Ok(manifest)
     }
 
-    async fn search(&self, http: &reqwest::Client, manifest: &Manifest, query: &str, atmos: bool) -> anyhow::Result<Vec<Candidate>> {
+    async fn search(&self, http: &reqwest::Client, manifest: &Manifest, query: &str, atmos: bool, fresh: bool) -> anyhow::Result<Vec<Candidate>> {
         let key = format!("{}|{query}|{atmos}", manifest.quality);
-        if let Some(hit) = self.searches.lock().await.get(&key) {
+        if !fresh && let Some((at, hit)) = self.searches.lock().await.get(&key)
+            && at.elapsed() < SEARCH_TTL
+        {
             return Ok(hit.clone());
         }
-        let mut params = manifest.defaults.clone();
-        params.push(("quality".to_owned(), manifest.quality.clone()));
-        if atmos {
-            params.push(("atmos".to_owned(), "auto".to_owned()));
-        }
+        let mut params = manifest.params(atmos);
         params.push(("q".to_owned(), query.to_owned()));
         let url = self.endpoint(&["search"], &params)?;
         let json = get_json(http, &url).await?;
-        let tracks = json.get("tracks").and_then(Value::as_array).cloned().unwrap_or_default();
+        let tracks = json.get("tracks").and_then(Value::as_array).ok_or_else(|| anyhow::anyhow!("the addon returned no track list"))?;
         let found: Vec<Candidate> = tracks.iter().filter_map(candidate).take(400).collect();
         let mut cache = self.searches.lock().await;
         if cache.len() > 64 {
             cache.clear();
         }
-        cache.insert(key, found.clone());
+        if !found.is_empty() {
+            cache.insert(key, (std::time::Instant::now(), found.clone()));
+        } else {
+            cache.remove(&key);
+        }
         Ok(found)
     }
 
-    async fn stream(&self, http: &reqwest::Client, manifest: &Manifest, candidate: &Candidate, atmos: bool) -> anyhow::Result<Option<Stream>> {
-        let mut params = manifest.defaults.clone();
-        params.push(("quality".to_owned(), manifest.quality.clone()));
-        if atmos {
-            params.push(("atmos".to_owned(), "auto".to_owned()));
-        }
+    async fn stream(&self, http: &reqwest::Client, manifest: &Manifest, candidate: &Candidate, atmos: bool) -> anyhow::Result<Stream> {
+        let params = manifest.params(atmos);
         let url = self.endpoint(&["stream", &candidate.id], &params)?;
         let json = match get_json(http, &url).await {
             Ok(j) => j,
@@ -241,7 +278,7 @@ impl Client {
             // decode it whole, so it plays (and seeks) like any other stream.
             let dash = matches!(transport.trim().to_ascii_lowercase().as_str(), "dash" | "mpd" | "application/dash+xml");
             let dolby = ["eac3", "ec-3", "ac3", "ac-3", "dolby", "atmos"].iter().any(|w| codec.to_ascii_lowercase().contains(w)) || json_is_atmos(&json);
-            anyhow::ensure!(dash && dolby, "the addon returned a streaming manifest, not a file");
+            anyhow::ensure!(atmos && dash && dolby, "the addon returned an unsupported streaming manifest");
             let audio = crate::dash::fetch(http, &stated_url).await?;
             let size = audio.pcm.len() as u64;
             let info = Info {
@@ -257,21 +294,14 @@ impl Client {
                 size,
                 duration_ms: audio.duration_ms,
             };
-            return Ok(Some(Stream { url: stated_url, size, duration_ms: audio.duration_ms, format: Format::Pcm { rate: audio.sample_rate, channels: 2 }, info, data: Some(audio.pcm) }));
+            return Ok(Stream { url: stated_url, size, duration_ms: audio.duration_ms, format: Format::Pcm { rate: audio.sample_rate, channels: 2 }, info, data: Some(audio.pcm) });
         }
-        let Some(format) = format_of(&codec, container, mime, &stated_url, &label) else {
+        anyhow::ensure!(!atmos, "the addon returned a stereo file");
+        let declared_format = json.get("format").and_then(Value::as_str).unwrap_or("");
+        let Some(format) = format_of(&codec, &format!("{container} {declared_format}"), mime, &stated_url, &label) else {
             anyhow::bail!("the addon's format isn't playable ({codec} {container} {mime})");
         };
-        let mut size = json_size(&json);
-        if size == 0 {
-            size = content_size(http, &stated_url).await.unwrap_or(0);
-        }
-        // Some addon URLs only reveal their size once the stream starts; use a placeholder
-        // large enough for ranged reads and let the download determine the real end.
-        if size == 0 {
-            log::info!("hi-res: stream size unknown for \"{}\", using ranged placeholder", candidate.title);
-            size = UNKNOWN_SIZE;
-        }
+        let (size, data) = probe_media(http, &stated_url, json_size(&json)).await?;
         let sample_rate = json.get("sampleRate").and_then(Value::as_f64).filter(|r| *r > 0.0).map(|r| if r < 1000.0 { (r * 1000.0) as u32 } else { r as u32 })
             .or_else(|| number_before(&label, "khz").map(|r| (r * 1000.0) as u32));
         let bit_depth = json.get("bitDepth").and_then(Value::as_f64).filter(|b| *b > 0.0).map(|b| b as u32)
@@ -279,21 +309,20 @@ impl Client {
         let bitrate_kbps = json.get("bitrate").and_then(Value::as_f64).filter(|k| *k > 0.0).map(|k| if k > 3000.0 { (k / 1000.0) as u32 } else { k as u32 })
             .or_else(|| number_before(&label, "kbps").map(|k| k as u32));
         let duration_ms = candidate.duration.map_or(0, |s| s as u64 * 1000);
-        let atmos = candidate.atmos || json_is_atmos(&json);
         let info = Info {
             source: manifest.name.clone().unwrap_or_else(|| host_of(&self.base)),
             host: host_of(&stated_url),
-            codec: codec_name(&codec, &format),
+            codec: codec_name(&codec, &format, &quality, declared_format),
             quality: if quality.is_empty() { candidate.quality.clone() } else { quality },
-            bitrate_kbps,
+            bitrate_kbps: bitrate_kbps.or_else(|| size.checked_mul(8)?.checked_div(duration_ms)?.try_into().ok()),
             sample_rate,
             bit_depth,
             channels: None,
-            atmos,
+            atmos: false,
             size,
             duration_ms,
         };
-        Ok(Some(Stream { url: stated_url, size, duration_ms, format, info, data: None }))
+        Ok(Stream { url: stated_url, size, duration_ms, format, info, data })
     }
 
     fn endpoint(&self, segments: &[&str], params: &[(String, String)]) -> anyhow::Result<String> {
@@ -315,15 +344,30 @@ impl Client {
     }
 }
 
+impl Manifest {
+    fn params(&self, atmos: bool) -> Vec<(String, String)> {
+        let mut params = self.defaults.clone();
+        params.push(("quality".to_owned(), self.quality.clone()));
+        if atmos || params.iter().any(|(key, _)| key.eq_ignore_ascii_case("atmos")) {
+            params.retain(|(key, _)| !key.eq_ignore_ascii_case("atmos"));
+            params.push(("atmos".to_owned(), if atmos { "auto" } else { "stereo" }.to_owned()));
+        }
+        params
+    }
+}
+
 /// The base URL with a trailing slash or a pasted `…/manifest.json` taken off.
 pub fn normalize_base(raw: &str) -> String {
-    let trimmed = raw.trim().trim_end_matches('/');
-    let last = trimmed.rsplit('/').next().unwrap_or("");
-    if last.to_ascii_lowercase().ends_with(".json") && trimmed.contains("://") {
-        trimmed[..trimmed.len() - last.len()].trim_end_matches('/').to_owned()
+    let raw = raw.trim();
+    let (root, suffix) = raw.split_at(raw.find(['?', '#']).unwrap_or(raw.len()));
+    let root = root.trim_end_matches('/');
+    let last = root.rsplit('/').next().unwrap_or("");
+    let root = if last.to_ascii_lowercase().ends_with(".json") && root.contains("://") {
+        root[..root.len() - last.len()].trim_end_matches('/')
     } else {
-        trimmed.to_owned()
-    }
+        root
+    };
+    format!("{root}{suffix}")
 }
 
 fn host_of(url: &str) -> String {
@@ -332,19 +376,30 @@ fn host_of(url: &str) -> String {
 
 fn settings(value: Option<&Value>) -> (Vec<(String, String)>, String) {
     let mut defaults = Vec::new();
-    let mut quality = TIER.to_owned();
-    let Some(list) = value.and_then(Value::as_array) else { return (defaults, quality) };
+    let mut quality = None;
+    let mut alias = None;
+    let Some(list) = value.and_then(Value::as_array) else { return (defaults, TIER.to_owned()) };
     for entry in list {
         let Some(key) = entry.get("key").and_then(Value::as_str).map(str::trim).filter(|k| !k.is_empty()) else { continue };
-        let Some(default) = entry.get("default").and_then(query_value) else { continue };
+        let default = entry.get("default").and_then(query_value);
         if key.eq_ignore_ascii_case("quality") {
-            let options: Vec<String> = entry.get("options").and_then(Value::as_array).map(|a| a.iter().filter_map(|o| o.get("value").and_then(query_value)).collect()).unwrap_or_default();
-            quality = match_tier(&options);
-        } else {
+            quality = first_option(entry).or(default);
+        } else if key.eq_ignore_ascii_case("audio_quality") {
+            alias = first_option(entry).or(default);
+        } else if let Some(default) = default {
             defaults.push((key.to_owned(), default));
         }
     }
-    (defaults, quality)
+    if let Some(value) = alias.as_ref() {
+        defaults.push(("audio_quality".to_owned(), value.clone()));
+    }
+    (defaults, quality.or(alias).unwrap_or_else(|| TIER.to_owned()))
+}
+
+/// The protocol lists quality options in descending order.
+fn first_option(entry: &Value) -> Option<String> {
+    entry.get("options")?.as_array()?.iter()
+        .find_map(|option| query_value(option.get("value").unwrap_or(option)))
 }
 
 fn query_value(v: &Value) -> Option<String> {
@@ -354,18 +409,6 @@ fn query_value(v: &Value) -> Option<String> {
         Value::Bool(b) => Some(b.to_string()),
         _ => None,
     }
-}
-
-/// The option that best answers a lossless request.
-fn match_tier(options: &[String]) -> String {
-    if options.is_empty() {
-        return TIER.to_owned();
-    }
-    if let Some(exact) = options.iter().find(|o| o.eq_ignore_ascii_case(TIER)) {
-        return exact.clone();
-    }
-    const WORDS: [&str; 7] = ["lossless", "flac", "hifi", "hi-res", "hires", "max", "best"];
-    options.iter().find(|o| WORDS.iter().any(|w| o.to_ascii_lowercase().contains(w))).cloned().unwrap_or_else(|| options[0].clone())
 }
 
 fn candidate(v: &Value) -> Option<Candidate> {
@@ -419,7 +462,8 @@ fn json_size(v: &Value) -> u64 {
 /// A row or stream that says it's Dolby Atmos, under any of the names addons use for it.
 fn json_is_atmos(v: &Value) -> bool {
     const KEYS: [&str; 7] = ["audioMode", "audioModes", "quality", "streamQuality", "audioQuality", "format", "codec"];
-    KEYS.iter().any(|key| v.get(*key).is_some_and(value_is_atmos))
+    v.get("atmos").and_then(Value::as_bool) == Some(true)
+        || KEYS.iter().any(|key| v.get(*key).is_some_and(value_is_atmos))
 }
 
 fn value_is_atmos(v: &Value) -> bool {
@@ -469,10 +513,10 @@ fn format_of(codec: &str, container: &str, mime: &str, url: &str, label: &str) -
     if all.contains("flac") {
         return Some(file("flac", "audio/flac"));
     }
-    if (all.contains("alac") || ext == "m4a" || ext == "mp4" || mime.contains("mp4")) && has_lossless_word(label) {
+    if all.contains("alac") || ext == "m4a" || ext == "mp4" || mime.contains("mp4") {
         return Some(file("m4a", "audio/mp4"));
     }
-    if all.contains("wav") && !all.contains("wave") {
+    if all.contains("wav") {
         return Some(file("wav", "audio/wav"));
     }
     if all.contains("mp3") || mime.contains("mpeg") {
@@ -494,7 +538,7 @@ fn format_of(codec: &str, container: &str, mime: &str, url: &str, label: &str) -
     None
 }
 
-fn codec_name(codec: &str, format: &Format) -> String {
+fn codec_name(codec: &str, format: &Format, quality: &str, declared_format: &str) -> String {
     let codec = codec.trim();
     if !codec.is_empty() {
         return codec.to_ascii_uppercase();
@@ -508,7 +552,8 @@ fn codec_name(codec: &str, format: &Format) -> String {
             "wav" => "WAV",
             "mp3" => "MP3",
             "ogg" => "VORBIS",
-            _ => "ALAC",
+            "m4a" if declared_format.eq_ignore_ascii_case("alac") || has_lossless_word(quality) => "ALAC",
+            _ => "AAC",
         },
     }
     .to_owned()
@@ -517,6 +562,11 @@ fn codec_name(codec: &str, format: &Format) -> String {
 fn has_lossless_word(text: &str) -> bool {
     let text = text.to_ascii_lowercase();
     ["lossless", "flac", "hifi", "hi-res", "hires", "master", "24bit", "24-bit"].iter().any(|w| text.contains(w))
+}
+
+fn has_hires_word(text: &str) -> bool {
+    let text = text.to_ascii_lowercase();
+    ["hi-res", "hi_res", "hires", "24-bit", "24bit"].iter().any(|w| text.contains(w))
 }
 
 /// The number just before `unit` in free text (`24-bit`, `96 kHz`, `1411kbps`).
@@ -552,14 +602,14 @@ fn number_before(text: &str, unit: &str) -> Option<f64> {
 
 fn rank(mut candidates: Vec<Candidate>, title: &str, artist: &str, duration: Option<u32>, prefer_atmos: bool) -> Vec<Candidate> {
     let mut scored: Vec<(Candidate, i32)> = candidates.drain(..).filter_map(|c| score(&c, title, artist, duration, prefer_atmos).map(|s| (c, s))).collect();
-    scored.sort_by(|a, b| b.1.cmp(&a.1));
+    scored.sort_by_key(|(c, score)| std::cmp::Reverse((prefer_atmos && c.atmos, *score, has_hires_word(&c.quality))));
     scored.into_iter().map(|(c, _)| c).collect()
 }
 
 fn score(candidate: &Candidate, title: &str, artist: &str, duration: Option<u32>, prefer_atmos: bool) -> Option<i32> {
     let wanted = title_parts(title, artist);
     let got = title_parts(&candidate.title, &candidate.artist);
-    if wanted.0.is_empty() || wanted.0 != got.0 || wanted.1 != got.1 {
+    if wanted.0.is_empty() || match_key(&wanted.0) != match_key(&got.0) || wanted.1 != got.1 {
         return None;
     }
     let target_artists = artist_names(artist);
@@ -586,7 +636,8 @@ fn score(candidate: &Candidate, title: &str, artist: &str, duration: Option<u32>
         _ => 0,
     };
     let atmos_score = if prefer_atmos && candidate.atmos { 8 } else { 0 };
-    Some(100 + artist_score + duration_score + atmos_score)
+    let title_score = if wanted.0 == got.0 { 100 } else { 90 };
+    Some(title_score + artist_score + duration_score + atmos_score)
 }
 
 /// The title with the packaging taken off, version markers kept.
@@ -600,8 +651,8 @@ fn searchable_title(title: &str, artist: &str) -> String {
     out.trim().to_owned()
 }
 
-fn primary_artist(artist: &str) -> String {
-    artist.to_ascii_lowercase().split([',', '&', '/', ';', '·', '|']).next().unwrap_or("").trim().to_owned()
+fn primary_artist(artist: &str) -> &str {
+    artist.split([',', '&', '/', ';', '·', '|']).next().unwrap_or("").trim()
 }
 
 type TitleParts = (String, Vec<String>);
@@ -609,7 +660,7 @@ type TitleParts = (String, Vec<String>);
 /// A title split into its core words and its version markers.
 fn title_parts(raw: &str, artist: &str) -> TitleParts {
     let mut versions = BTreeSet::new();
-    let mut text = raw.to_ascii_lowercase().replace('&', " and ");
+    let mut text = raw.to_lowercase().replace('&', " and ");
     for _ in 0..3 {
         let Some((start, end)) = bracket_span(&text) else { break };
         classify(&text[start + 1..end], &mut versions);
@@ -638,7 +689,8 @@ fn title_parts(raw: &str, artist: &str) -> TitleParts {
             text.truncate(at);
         }
     }
-    let mut words: Vec<String> = text.split([' ', '.', '·']).map(clean).filter(|w| !w.is_empty() && w != "and").collect();
+    let mut words: Vec<String> = text.split(|c: char| c.is_whitespace() || matches!(c, '.' | '·'))
+        .map(clean).filter(|w| !w.is_empty() && w != "and").collect();
     while words.len() > 1 && matches!(words.last().map(String::as_str), Some("song" | "songs" | "video" | "audio" | "lyrics" | "official" | "full" | "hd" | "hq" | "4k" | "mp3" | "ost" | "soundtrack")) {
         words.pop();
     }
@@ -675,19 +727,20 @@ fn is_artist_name(text: &str, artist: &str) -> bool {
     if words.is_empty() {
         return false;
     }
-    let credited: Vec<String> = artist.to_ascii_lowercase().split([' ', '.', '·']).map(clean).filter(|w| !w.is_empty()).collect();
+    let credited: Vec<String> = artist.to_lowercase().split([' ', '.', '·']).map(clean).filter(|w| !w.is_empty()).collect();
     words.iter().all(|w| credited.contains(w))
 }
 
 fn artist_names(value: &str) -> Vec<Vec<String>> {
-    let normalized = value.to_ascii_lowercase().trim().to_owned();
-    if normalized.is_empty() || matches!(normalized.as_str(), "unknown" | "unknown artist" | "unknown artist(s)") {
+    let normalized = value.to_lowercase();
+    let normalized = normalized.trim();
+    if normalized.is_empty() || matches!(normalized, "unknown" | "unknown artist" | "unknown artist(s)") {
         return Vec::new();
     }
     normalized
         .split([',', '&', '/', ';', '·', '|'])
         .map(|name| {
-            let mut parts: Vec<String> = name.split([' ', '.']).map(clean).filter(|w| w.len() > 1).collect();
+            let mut parts: Vec<String> = name.split([' ', '.']).map(|word| match_key(&clean(word))).filter(|w| w.chars().count() > 1).collect();
             if parts.is_empty() {
                 parts = vec![name.trim().to_owned()];
             }
@@ -725,7 +778,19 @@ fn contains_words(outer: &[String], inner: &[String]) -> bool {
 }
 
 fn clean(word: &str) -> String {
-    word.chars().filter(|c| c.is_ascii_alphanumeric()).collect()
+    word.nfc().filter(|c| c.is_alphanumeric() || is_combining_mark(*c)).collect()
+}
+
+/// Fold Latin accents for catalogues with unaccented metadata. Keep other scripts' marks.
+fn match_key(word: &str) -> String {
+    let mut latin = false;
+    word.nfd().filter(|c| {
+        if is_combining_mark(*c) {
+            return !latin;
+        }
+        latin = c.is_ascii_alphabetic();
+        true
+    }).map(|c| if c == 'đ' { 'd' } else { c }).collect()
 }
 
 const VERSION_WORDS: &[&str] = &[
@@ -737,36 +802,45 @@ const VERSION_WORDS: &[&str] = &[
 // ── HTTP ─────────────────────────────────────────────────────────────────
 
 async fn get_json(http: &reqwest::Client, url: &str) -> anyhow::Result<Value> {
-    let response = http.get(url).timeout(REQUEST_TIMEOUT).header("Accept", "application/json").header("User-Agent", USER_AGENT).send().await?;
+    let response = http.get(url).timeout(REQUEST_TIMEOUT).header("Accept", "application/json").header("User-Agent", USER_AGENT).send().await
+        .map_err(reqwest::Error::without_url)?;
     let status = response.status();
     if status == reqwest::StatusCode::NOT_FOUND {
         anyhow::bail!("not found");
     }
     anyhow::ensure!(status.is_success(), "HTTP {}", status.as_u16());
-    let bytes = response.bytes().await?;
+    let bytes = response.bytes().await.map_err(reqwest::Error::without_url)?;
     anyhow::ensure!(!bytes.is_empty(), "the addon answered with nothing");
     Ok(serde_json::from_slice(&bytes)?)
 }
 
-/// How many bytes the stream holds, from a HEAD or a one-byte range request.
-async fn content_size(http: &reqwest::Client, url: &str) -> Option<u64> {
-    if let Ok(response) = http.head(url).timeout(PROBE_TIMEOUT).header("User-Agent", USER_AGENT).send().await
-        && response.status().is_success()
-        && let Some(size) = response.headers().get(reqwest::header::CONTENT_LENGTH)
-            .and_then(|v| v.to_str().ok()?.parse::<u64>().ok())
-            .filter(|n| *n > 0)
-    {
-        return Some(size);
+/// Confirm the signed media URL is usable and find its real length.
+async fn probe_media(http: &reqwest::Client, url: &str, stated_size: u64) -> anyhow::Result<(u64, Option<Vec<u8>>)> {
+    use reqwest::{StatusCode, header};
+    let request = || http.get(url).timeout(PROBE_TIMEOUT).header("User-Agent", USER_AGENT).header(header::ACCEPT_ENCODING, "identity");
+    let mut response = request().header(header::RANGE, "bytes=0-0").send().await.map_err(reqwest::Error::without_url)?;
+    if response.status() == StatusCode::PARTIAL_CONTENT {
+        let total = response.headers().get(header::CONTENT_RANGE).and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("bytes 0-0/")).and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(stated_size);
+        if total > 0 {
+            return Ok((total, None));
+        }
     }
-    let response = http.get(url).timeout(PROBE_TIMEOUT).header("User-Agent", USER_AGENT).header("Range", "bytes=0-0").header("Accept-Encoding", "identity").send().await.ok()?;
-    if let Some(range) = response.headers().get(reqwest::header::CONTENT_RANGE).and_then(|v| v.to_str().ok())
-        && let Some(total) = range.rsplit('/').next().and_then(|s| s.trim().parse::<u64>().ok())
-    {
-        return Some(total);
+    if matches!(response.status(), StatusCode::PARTIAL_CONTENT | StatusCode::BAD_REQUEST | StatusCode::FORBIDDEN | StatusCode::METHOD_NOT_ALLOWED | StatusCode::RANGE_NOT_SATISFIABLE | StatusCode::TOO_MANY_REQUESTS) {
+        response = request().send().await.map_err(reqwest::Error::without_url)?;
     }
-    (response.status() == reqwest::StatusCode::OK)
-        .then(|| response.content_length().filter(|n| *n > 0))
-        .flatten()
+    anyhow::ensure!(response.status() == StatusCode::OK, "addon media returned HTTP {}", response.status().as_u16());
+    if let Some(size) = response.content_length().filter(|n| *n > 0) {
+        return Ok((size, None));
+    }
+    let mut data = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(reqwest::Error::without_url)? {
+        anyhow::ensure!(data.len() + chunk.len() <= MAX_UNSIZED_BYTES, "addon media without a length is too large");
+        data.extend_from_slice(&chunk);
+    }
+    anyhow::ensure!(!data.is_empty(), "the addon media is empty");
+    Ok((data.len() as u64, Some(data)))
 }
 
 #[cfg(test)]
@@ -774,10 +848,42 @@ mod tests {
     use super::*;
 
     #[test]
+    fn lookup_preserves_vietnamese_titles_and_other_scripts() {
+        assert_eq!(searchable_title("Rực Rỡ (Official Audio)", "Mỹ Tâm"), "rực rỡ");
+        assert_eq!(searchable_title("夜に駆ける", "YOASOBI"), "夜に駆ける");
+        let hit = candidate(&serde_json::json!({"id": "1", "title": "Kho Bau", "artist": "(S)TRONG", "duration": 197})).unwrap();
+        assert!(score(&hit, "Kho Báu", "(S)TRONG", Some(197), false).is_some());
+        assert!(score(&hit, "Kho Báu (Live)", "(S)TRONG", Some(197), false).is_none());
+    }
+
+    #[test]
+    fn best_quality_uses_the_addons_first_option_even_without_a_default() {
+        let config = serde_json::json!([{
+            "key": "quality", "options": [{"value": "HI_RES_LOSSLESS"}, {"value": "LOSSLESS"}]
+        }]);
+        assert_eq!(settings(Some(&config)).1, "HI_RES_LOSSLESS");
+        let config = serde_json::json!([{
+            "key": "audio_quality", "options": [{"value": "HI_RES_LOSSLESS"}, {"value": "LOSSLESS"}]
+        }]);
+        assert_eq!(settings(Some(&config)).1, "HI_RES_LOSSLESS");
+    }
+
+    #[test]
+    fn a_lossy_stream_does_not_inherit_a_lossless_or_atmos_badge() {
+        let info = Info {
+            source: "Addon".into(), host: "example".into(), codec: "AAC".into(),
+            quality: "LOSSLESS".into(), bitrate_kbps: Some(320), sample_rate: Some(48_000),
+            bit_depth: None, channels: None, atmos: false, size: 1, duration_ms: 1,
+        };
+        assert_eq!(info.badge(), "320 kbps");
+    }
+
+    #[test]
     fn base_is_normalized_like_the_addon_protocol() {
         assert_eq!(normalize_base(" https://music.example/addon/ "), "https://music.example/addon");
         assert_eq!(normalize_base("https://music.example/addon/manifest.json"), "https://music.example/addon");
         assert_eq!(normalize_base("https://music.example/addon/MANIFEST.JSON"), "https://music.example/addon");
+        assert_eq!(normalize_base("https://music.example/addon/manifest.json?key=test"), "https://music.example/addon?key=test");
         assert_eq!(normalize_base("https://music.example"), "https://music.example");
     }
 

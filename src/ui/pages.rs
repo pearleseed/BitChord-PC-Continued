@@ -240,27 +240,33 @@ struct ListCtx<'a> {
     sel: &'a mut Selection,
     page: &'a Page,
     own: bool,
+    filtered: Option<&'a [usize]>,
 }
 
 /// A long song list; only the rows on screen are built. Clicking one plays `tracks` from it,
 /// or picks it while selecting: Ctrl-click picks one song, Shift-click a run of them.
 #[allow(clippy::too_many_arguments)]
 fn list(ui: &mut Ui, rows: &Rows, liked: &HashSet<String>, tracks: &[Track], show_album: bool, number: impl Fn(usize, &Track) -> Option<usize>, cx: ListCtx, acts: &mut Vec<Action>) {
-    let ListCtx { sel, page, own } = cx;
+    let ListCtx { sel, page, own, filtered } = cx;
     let selecting = sel.on(page);
     let mods = ui.input(|i| i.modifiers);
-    widgets::visible_rows(ui, tracks.len(), |ui, i| {
-        let t = &tracks[i];
+    widgets::visible_rows(ui, filtered.map_or(tracks.len(), <[usize]>::len), |ui, i| {
+        let row = filtered.map_or(i, |indices| indices[i]);
+        let t = &tracks[row];
         let o = RowOpts {
-            selected: selecting.then(|| sel.rows.contains(&i)),
-            remove: own.then_some(i),
+            selected: selecting.then(|| sel.rows.contains(&row)),
+            remove: own.then_some(row),
             ..rows.opts(liked, t, number(i, t), show_album)
         };
         if track_row(ui, t, &o, acts).clicked() {
             if selecting || mods.command || mods.shift {
-                sel.pick(page, i, mods.shift);
+                sel.pick(page, i, mods.shift, filtered);
             } else {
-                acts.push(Action::Play(tracks.to_vec(), i));
+                let songs = match filtered {
+                    Some(indices) => indices.iter().map(|&row| tracks[row].clone()).collect(),
+                    None => tracks.to_vec(),
+                };
+                acts.push(Action::Play(songs, i));
             }
         }
     });
@@ -294,9 +300,10 @@ fn selection_bar(app: &mut App, ctx: &egui::Context, page: &Page, area: Rect) {
     }
     let Some((tracks, own)) = selectable(app, page) else { return };
     let n = tracks.len();
-    let picked: Vec<Track> = app.selection.rows.iter().filter_map(|&i| tracks.get(i).cloned()).collect();
-    let all = !picked.is_empty() && picked.len() == n;
-    let all_liked = !picked.is_empty() && picked.iter().all(|t| app.liked.contains(&t.id));
+    let picked = || app.selection.rows.iter().filter_map(|&i| tracks.get(i));
+    let count = picked().count();
+    let all = count != 0 && count == n;
+    let all_liked = count != 0 && picked().all(|t| app.liked.contains(&t.id));
     // Labelled buttons when there's room, icons with tooltips when the window is narrow.
     let wide = area.width() > 820.0;
     let button = |ui: &mut Ui, label: &str, glyph: char, primary: bool| {
@@ -318,21 +325,21 @@ fn selection_bar(app: &mut App, ctx: &egui::Context, page: &Page, area: Rect) {
                 .show(ui, |ui| {
                     ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                         ui.spacing_mut().item_spacing.x = 8.0;
-                        let count = if picked.is_empty() { "Select songs".to_owned() } else { format!("{} selected", picked.len()) };
-                        ui.label(RichText::new(count).font(theme::semibold(14.0)).color(theme::text()));
+                        let label = if count == 0 { "Select songs".to_owned() } else { format!("{count} selected") };
+                        ui.label(RichText::new(label).font(theme::semibold(14.0)).color(theme::text()));
                         ui.add_space(10.0);
-                        if !picked.is_empty() {
+                        if count != 0 {
                             if button(ui, "Add to playlist", icon::LIST_PLUS, true).clicked() {
-                                acts.push(Action::AddToPlaylist(picked.clone()));
+                                acts.push(Action::AddToPlaylist(picked().cloned().collect()));
                             }
                             if own && button(ui, "Remove from playlist", icon::LIST_MINUS, false).clicked() {
                                 acts.push(Action::RemoveFromPlaylist(app.selection.rows.iter().copied().collect()));
                             }
                             if button(ui, if all_liked { "Remove like" } else { "Like" }, icon::HEART, false).clicked() {
-                                acts.push(Action::LikeMany(picked.clone(), !all_liked));
+                                acts.push(Action::LikeMany(picked().cloned().collect(), !all_liked));
                             }
                             if button(ui, "Add to queue", icon::LIST_MUSIC, false).clicked() {
-                                acts.extend(picked.iter().cloned().map(Action::Enqueue));
+                                acts.extend(picked().cloned().map(Action::Enqueue));
                             }
                         }
                         toggle_all = button(ui, if all { "Select none" } else { "Select all" }, icon::LIST_CHECKS, false).clicked();
@@ -643,7 +650,7 @@ fn collection(app: &mut App, ui: &mut Ui, id: &str, now: f64) {
             ui.add_space(2.0);
             let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 20.0), Sense::hover());
             widgets::linked_text(ui, r.min, &c.byline(), &c.artists, theme::regular(15.0), theme::text_dim(), r.width(), acts);
-            let total: u32 = tracks.iter().filter_map(|t| t.duration).sum();
+            let total = o.duration();
             if total > 0 {
                 ui.label(
                     RichText::new(format!("{} {} • {} min", tracks.len(), if podcast { "episodes" } else { "songs" }, total / 60)).font(theme::regular(13.5)).color(theme::text_faint()),
@@ -772,24 +779,10 @@ fn collection(app: &mut App, ui: &mut Ui, id: &str, now: f64) {
     if dismiss_search {
         app.coll_search = None;
     }
-    let needle = app.coll_search.as_ref().filter(|(fid, _)| fid == id).map(|(_, q)| q.trim().to_lowercase()).unwrap_or_default();
-    let filtered: Vec<Track> = if needle.is_empty() {
-        Vec::new()
-    } else {
-        c.tracks
-            .iter()
-            .filter(|t| {
-                t.title.to_lowercase().contains(&needle)
-                    || t.artist_line().to_lowercase().contains(&needle)
-                    || t.album.as_ref().is_some_and(|a| a.name.to_lowercase().contains(&needle))
-            })
-            .cloned()
-            .collect()
-    };
-    let shown: &[Track] = if needle.is_empty() { tracks } else { &filtered };
+    let filtered = app.coll_search.as_ref().filter(|(fid, _)| fid == id).and_then(|(_, query)| o.matching_rows(query));
     let number = |i: usize, t: &Track| is_album.then(|| t.track_nr.map_or(i + 1, |n| n as usize));
     let own = app.logged_in && c.owned && !is_album;
-    list(ui, &rows, &app.liked, shown, !is_album, number, ListCtx { sel: &mut app.selection, page: &app.page, own }, acts);
+    list(ui, &rows, &app.liked, tracks, !is_album, number, ListCtx { sel: &mut app.selection, page: &app.page, own, filtered: filtered.as_deref() }, acts);
     if more {
         widgets::skeleton_rows(ui, now, 3);
     }
@@ -1000,7 +993,7 @@ fn library(app: &mut App, ui: &mut Ui, tab: LibTab, now: f64) {
                 return;
             }
             let Some(h) = &app.history else { return };
-            list(ui, &rows, &app.liked, h, true, plain, ListCtx { sel: &mut app.selection, page: &app.page, own: false }, &mut app.actions);
+            list(ui, &rows, &app.liked, h, true, plain, ListCtx { sel: &mut app.selection, page: &app.page, own: false, filtered: None }, &mut app.actions);
         }
         LibTab::Uploads => {
             ui.horizontal(|ui| {
@@ -1025,7 +1018,7 @@ fn library(app: &mut App, ui: &mut Ui, tab: LibTab, now: f64) {
                 ui.add_space(20.0);
                 ui.label(RichText::new("No uploads yet").color(theme::text_dim()));
             }
-            list(ui, &rows, &app.liked, up, true, plain, ListCtx { sel: &mut app.selection, page: &app.page, own: false }, &mut app.actions);
+            list(ui, &rows, &app.liked, up, true, plain, ListCtx { sel: &mut app.selection, page: &app.page, own: false, filtered: None }, &mut app.actions);
         }
         // Liked Music, kept like any playlist.
         LibTab::Songs => {
@@ -1050,7 +1043,7 @@ fn library(app: &mut App, ui: &mut Ui, tab: LibTab, now: f64) {
                 });
                 ui.add_space(10.0);
             }
-            list(ui, &rows, &app.liked, liked, true, plain, ListCtx { sel: &mut app.selection, page: &app.page, own: false }, &mut app.actions);
+            list(ui, &rows, &app.liked, liked, true, plain, ListCtx { sel: &mut app.selection, page: &app.page, own: false, filtered: None }, &mut app.actions);
             if more {
                 widgets::skeleton_rows(ui, now, 3);
             }
@@ -1085,7 +1078,7 @@ fn library(app: &mut App, ui: &mut Ui, tab: LibTab, now: f64) {
 
 fn downloads(app: &mut App, ui: &mut Ui, now: f64) {
     page_title(ui, "Downloads");
-    let songs = crate::downloads::list();
+    let songs = crate::downloads::list(ui.ctx());
     ui.add_space(4.0);
     ui.label(
         RichText::new(format!("{} songs \u{2022} {}", songs.len(), crate::downloads::folder().display()))
@@ -1109,10 +1102,10 @@ fn downloads(app: &mut App, ui: &mut Ui, now: f64) {
     }
     ui.horizontal(|ui| {
         if pill(ui, "Play", Some(icon::PLAY), true).clicked() {
-            app.actions.push(Action::Play(songs.clone(), 0));
+            app.actions.push(Action::Play(songs.to_vec(), 0));
         }
         if pill(ui, "Shuffle", Some(icon::SHUFFLE), false).clicked() {
-            let mut t = songs.clone();
+            let mut t = songs.to_vec();
             super::shuffle(&mut t);
             app.actions.push(Action::Play(t, 0));
         }
@@ -1122,7 +1115,7 @@ fn downloads(app: &mut App, ui: &mut Ui, now: f64) {
     });
     ui.add_space(12.0);
     let rows = Rows::new(app, now);
-    list(ui, &rows, &app.liked, &songs, true, |_, _| None, ListCtx { sel: &mut app.selection, page: &app.page, own: false }, &mut app.actions);
+    list(ui, &rows, &app.liked, &songs, true, |_, _| None, ListCtx { sel: &mut app.selection, page: &app.page, own: false, filtered: None }, &mut app.actions);
 }
 
 // ------------------------------------------------------------------ settings
@@ -1249,6 +1242,16 @@ fn channel_picker(app: &mut App, ui: &mut Ui) {
 fn settings_playback(app: &mut App, ui: &mut Ui) {
     section_label(ui, "Playback", None);
     settings_card(ui, |ui| {
+        #[cfg(target_os = "macos")]
+        {
+            setting_row(ui, "Lock Screen Player", Some("Experimental. Show song details and playback controls when this Mac is locked."), |ui| {
+                let mut enabled = app.lock_screen_enabled;
+                if toggle(ui, &mut enabled, "Lock Screen Player").changed() {
+                    app.set_lock_screen_enabled(ui.ctx(), enabled);
+                }
+            });
+            divider(ui);
+        }
         setting_row(ui, "Autoplay", Some("Keep playing similar songs when the queue ends."), |ui| {
             toggle(ui, &mut app.autoplay, "Autoplay");
         });

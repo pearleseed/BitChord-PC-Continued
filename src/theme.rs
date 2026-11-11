@@ -67,11 +67,6 @@ pub fn macos_default() -> bool {
     cfg!(target_os = "macos") && crate::preset::active().id == crate::preset::DEFAULT_ID
 }
 
-pub fn sidebar_fill() -> Color32 {
-    let color = Color32::from_gray(if light() { 237 } else { 39 });
-    if reduce_transparency() { color } else { with_alpha(color, 0.92) }
-}
-
 fn display_preference(mask: u32) -> bool {
     #[cfg(target_os = "macos")]
     { crate::macos_chrome::preferences() & mask != 0 }
