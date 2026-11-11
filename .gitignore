@@ -6,6 +6,9 @@ target-bisect/
 *.profraw
 *.profdata
 
+# Local macOS distribution output
+/dist/
+
 # Environment & secrets
 .env
 .env.*

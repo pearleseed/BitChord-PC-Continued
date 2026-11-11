@@ -14,13 +14,31 @@ fn main() {
         println!("cargo:rustc-link-lib=framework=AppKit");
         println!("cargo:rustc-link-lib=framework=CoreGraphics");
         println!("cargo:rustc-link-lib=framework=CoreText");
-        cc::Build::new()
+        let mut native = cc::Build::new();
+        native
             .files([
                 "src/native/macos/window_chrome.m",
                 "src/native/macos/lock_screen.m",
             ])
-            .flag("-fobjc-arc")
-            .compile("bitchord_window_chrome");
+            .flag("-fobjc-arc");
+        native.compile("bitchord_window_chrome");
+
+        // @available needs Clang's runtime when ThinLTO removes Rust's unused
+        // availability helpers. Query the selected compiler, not an Xcode path.
+        let runtime = native
+            .get_compiler()
+            .to_command()
+            .arg("-print-file-name=libclang_rt.osx.a")
+            .output()
+            .expect("failed to locate the macOS Clang runtime");
+        assert!(runtime.status.success(), "Clang runtime lookup failed");
+        let runtime = String::from_utf8(runtime.stdout).expect("Clang runtime path is not UTF-8");
+        let runtime = runtime.trim();
+        assert!(
+            std::path::Path::new(runtime).is_file(),
+            "missing Clang runtime: {runtime}"
+        );
+        println!("cargo:rustc-link-arg={runtime}");
     }
 }
 

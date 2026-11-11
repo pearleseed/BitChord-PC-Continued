@@ -26,6 +26,43 @@ there is no need to copy `assets/` beside the executable.
 Last.fm credentials can be supplied through `LASTFM_API_KEY` and `LASTFM_SECRET`
 at build time or runtime. Without them, the app shows Last.fm as unconfigured.
 
+## Build a macOS DMG
+
+Run on macOS with the Xcode command-line tools installed:
+
+```sh
+./scripts/build-dmg.sh                 # This Mac's architecture
+./scripts/build-dmg.sh universal       # Apple Silicon and Intel
+```
+
+For a cross build, install the Rust targets first:
+
+```sh
+rustup target add aarch64-apple-darwin x86_64-apple-darwin
+```
+
+The script builds a locked release and creates
+`dist/bitchord-setup-<version>-macos-<arch>.dmg`, containing `bitchord.app` and an
+Applications shortcut. `arm64` and `x86_64` can also be selected explicitly.
+`BITCHORD_DMG_DIR` overrides the output directory. Version and minimum macOS
+version are read from Cargo and the linked executable.
+Publish per-architecture DMGs for the built-in updater; the universal DMG is
+intended for manual installation.
+
+Local builds use an ad-hoc signature. For direct distribution, configure a
+Developer ID Application identity and an existing `notarytool` Keychain profile:
+
+```sh
+BITCHORD_SIGN_IDENTITY='Developer ID Application: NAME (TEAMID)' \
+BITCHORD_NOTARY_PROFILE='your-notary-profile' \
+./scripts/build-dmg.sh
+```
+
+That enables hardened runtime, timestamps, DMG signing, notarization and ticket
+stapling. An ad-hoc signature does not provide Gatekeeper distribution approval.
+The script verifies the completed DMG before replacing an earlier output.
+See Apple's [Mac distribution packaging guide](https://developer.apple.com/documentation/xcode/packaging-mac-software-for-distribution).
+
 ## Project layout
 
 ```text
@@ -34,6 +71,7 @@ build.rs                Windows resources and macOS native bridge compilation
 src/main.rs             Desktop application entry point
 src/                    Application modules and UI
 src/native/macos/       Objective-C bridges used by the Rust application
+scripts/                macOS DMG build script and bundle metadata
 assets/                 Embedded application resources and font licenses
 server/                 Standalone Rust Jam relay and smoke client
 vendor/block/           Compatibility patch required by souvlaki on macOS
@@ -51,8 +89,8 @@ sources. Sign-in and verification flows use a system webview.
 
 Existing release downloads are available on
 [GitHub Releases](https://github.com/pearleseed/BitChord-PC-Continued/releases).
-This repository builds the application directly with Cargo; website and installer
-packaging sources have been removed.
+Build directly with Cargo, or use the macOS DMG script above for drag-to-Applications
+installation.
 
 ## License
 
